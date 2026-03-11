@@ -6,7 +6,6 @@ use fixedbitset::FixedBitSet;
 use nohash_hasher::{IntMap, IntSet};
 use smallvec::SmallVec;
 
-const INT_MAX: i32 = i32::MAX;
 const MAXDEP: i32 = 32768;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -51,10 +50,6 @@ struct Node {
     root: i32,
     children_start: Rc<RefCell<LinkNode>>,
     children_end: Rc<RefCell<LinkNode>>,
-
-    // for buffered operations
-    delete_edge_buf: Vec<(i32, usize)>,
-    insert_edge_buf: Vec<(i32, usize)>,
 }
 
 impl Node {
@@ -66,22 +61,24 @@ impl Node {
             root: -1,
             children_start: Rc::new(RefCell::new(LinkNode::new())),
             children_end: Rc::new(RefCell::new(LinkNode::new())),
-            delete_edge_buf: vec![],
-            insert_edge_buf: vec![],
         };
         node.children_start.borrow_mut().next = Some(node.children_end.clone());
         node.children_end.borrow_mut().prev = Some(node.children_start.clone());
         node
     }
 
+    #[inline]
     fn insert_neighbor(&mut self, u: i32) {
-        let index = self.insert_edge_buf.len() + self.delete_edge_buf.len();
-        self.insert_edge_buf.push((u, index));
+        if !self.neighbors.contains(&(u as i32)) {
+            self.neighbors.push(u as i32);
+        }
     }
 
-    fn delete_adj(&mut self, u: i32) {
-        let index = self.insert_edge_buf.len() + self.delete_edge_buf.len();
-        self.delete_edge_buf.push((u, index));
+    #[inline]
+    fn delete_neighbor(&mut self, u: i32) {
+        if let Some(i) = self.neighbors.iter().position(|&x| x == u as i32) {
+            self.neighbors.swap_remove(i);
+        }
     }
 
     fn insert_l_node(&mut self, v: Rc<RefCell<LinkNode>>) {
@@ -120,89 +117,6 @@ impl Node {
 
         v.children_start.borrow_mut().next = Some(v.children_end.clone());
         v.children_end.borrow_mut().prev = Some(v.children_start.clone());
-    }
-
-    fn flush(&mut self) {
-        if self.insert_edge_buf.is_empty() && self.delete_edge_buf.is_empty() {
-            return;
-        }
-
-        self.insert_edge_buf.sort();
-        self.delete_edge_buf.sort();
-
-        let mut i = 0;
-        let mut d = 0;
-        let ni = self.insert_edge_buf.len();
-        let nd = self.delete_edge_buf.len();
-
-        let mut l = vec![];
-
-        for j in 0..=self.neighbors.len() {
-            let v = if j < self.neighbors.len() {
-                self.neighbors[j]
-            } else {
-                INT_MAX
-            };
-
-            while i < ni && self.insert_edge_buf[i].0 < v {
-                while i + 1 < ni && self.insert_edge_buf[i].0 == self.insert_edge_buf[i + 1].0 {
-                    i += 1;
-                }
-                while d < nd && self.delete_edge_buf[d].0 < self.insert_edge_buf[i].0 {
-                    d += 1;
-                }
-                while d < nd && self.delete_edge_buf[d].0 == self.insert_edge_buf[i].0 {
-                    d += 1;
-                }
-                if d > 0
-                    && self.delete_edge_buf[d - 1].0 == self.insert_edge_buf[i].0
-                    && self.delete_edge_buf[d - 1].1 > self.insert_edge_buf[i].1
-                {
-                    i += 1;
-                    continue;
-                }
-                l.push(self.insert_edge_buf[i].0);
-                i += 1;
-            }
-
-            if j == self.neighbors.len() {
-                break;
-            }
-
-            while d < nd && self.delete_edge_buf[d].0 < v {
-                d += 1;
-            }
-
-            if d >= nd || self.delete_edge_buf[d].0 > v {
-                l.push(v);
-                while i < ni && self.insert_edge_buf[i].0 == v {
-                    i += 1;
-                }
-                continue;
-            }
-
-            if i < ni && self.insert_edge_buf[i].0 == v {
-                let mut ti = 0;
-                while i < ni && self.insert_edge_buf[i].0 == v {
-                    ti = self.insert_edge_buf[i].1;
-                    i += 1;
-                }
-
-                let mut td = 0;
-                while d < nd && self.delete_edge_buf[d].0 == v {
-                    td = self.delete_edge_buf[d].1;
-                    d += 1;
-                }
-
-                if ti > td {
-                    l.push(v);
-                }
-            }
-        }
-
-        self.insert_edge_buf.clear();
-        self.delete_edge_buf.clear();
-        self.neighbors = l.into();
     }
 }
 
@@ -303,7 +217,6 @@ impl DNDTree {
         let mut s: Vec<(i32, i32)> = vec![];
         self.used = vec![false; n];
         for i in 0..n {
-            self.nodes[i].flush();
             let length = self.nodes[i].neighbors.len() as i32;
             s.push((length, -(i as i32)));
         }
@@ -526,8 +439,8 @@ impl DNDTree {
         if u >= self.n || v >= self.n || u == v {
             return false;
         }
-        self.nodes[u].delete_adj(v as i32);
-        self.nodes[v].delete_adj(u as i32);
+        self.nodes[u].delete_neighbor(v as i32);
+        self.nodes[v].delete_neighbor(u as i32);
         true
     }
 
@@ -591,8 +504,6 @@ impl DNDTree {
         while i < self.vec_scratch_nodes.len() {
             let mut node = self.vec_scratch_nodes[i];
             i += 1;
-
-            self.nodes[node as usize].flush();
 
             let mut j = 0;
             while j < self.nodes[node as usize].neighbors.len() {
@@ -691,8 +602,6 @@ impl DNDTree {
 
         //  7 while 𝑄 ≠ ∅ do
         while let Some(mut node) = stack.pop() {
-            nodes[node].flush();
-
             //  9 foreach 𝑦 ∈ 𝑁(𝑥) do
             'neighbors: for neighbor in nodes[node].neighbors.iter().filter_map(|n| {
                 // 10 if 𝑦 = 𝑝𝑎𝑟𝑒𝑛𝑡(𝑥) then continue;
