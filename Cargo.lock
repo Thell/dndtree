@@ -108,6 +108,7 @@ name = "dndtree"
 version = "0.1.0"
 dependencies = [
  "divan",
+ "fixedbitset",
  "idtree",
  "nohash-hasher",
  "rand",

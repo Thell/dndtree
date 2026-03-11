@@ -2,7 +2,7 @@ use divan::Bencher;
 use dndtree::DNDTree;
 use nohash_hasher::{IntMap, IntSet};
 
-const ARGS: &[usize] = &[1_000, 10_000, 100_000];
+const ARGS: &[usize] = &[1_000, 10_000, 100_000, 200_000];
 
 fn make_adj(n: usize) -> IntMap<i32, IntSet<i32>> {
     let mut adj: IntMap<i32, IntSet<i32>> = IntMap::default();
@@ -58,7 +58,7 @@ mod with_union_find {
             });
     }
 
-    #[divan::bench(args = ARGS)]
+    #[divan::bench(args = [1_000, 10_000, 100_000])]
     fn bench_query(bencher: Bencher, n: usize) {
         let adj = make_adj(n);
         let mut tree = DNDTree::new(&adj, true);
@@ -131,7 +131,7 @@ mod without_union_find {
             });
     }
 
-    #[divan::bench(args = ARGS)]
+    #[divan::bench(args = [1_000, 10_000, 100_000])]
     fn bench_query(bencher: Bencher, n: usize) {
         let adj = make_adj(n);
         let mut tree = DNDTree::new(&adj, false);

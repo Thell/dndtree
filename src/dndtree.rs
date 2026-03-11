@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::vec;
 
+use fixedbitset::FixedBitSet;
 use nohash_hasher::{IntMap, IntSet};
 use smallvec::SmallVec;
 
@@ -40,7 +41,7 @@ impl LinkNode {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Node {
     // for graph
-    adj: SmallVec<[i32; 4]>,
+    neighbors: SmallVec<[i32; 4]>,
 
     // for tree
     parent: i32,
@@ -51,7 +52,7 @@ struct Node {
     children_start: Rc<RefCell<LinkNode>>,
     children_end: Rc<RefCell<LinkNode>>,
 
-    // for buffered adj operations
+    // for buffered operations
     delete_edge_buf: Vec<(i32, usize)>,
     insert_edge_buf: Vec<(i32, usize)>,
 }
@@ -59,7 +60,7 @@ struct Node {
 impl Node {
     fn new() -> Self {
         let node = Node {
-            adj: SmallVec::new(),
+            neighbors: SmallVec::new(),
             parent: -1,
             subtree_size: 0,
             root: -1,
@@ -73,7 +74,7 @@ impl Node {
         node
     }
 
-    fn insert_adj(&mut self, u: i32) {
+    fn insert_neighbor(&mut self, u: i32) {
         let index = self.insert_edge_buf.len() + self.delete_edge_buf.len();
         self.insert_edge_buf.push((u, index));
     }
@@ -136,9 +137,9 @@ impl Node {
 
         let mut l = vec![];
 
-        for j in 0..=self.adj.len() {
-            let v = if j < self.adj.len() {
-                self.adj[j]
+        for j in 0..=self.neighbors.len() {
+            let v = if j < self.neighbors.len() {
+                self.neighbors[j]
             } else {
                 INT_MAX
             };
@@ -164,7 +165,7 @@ impl Node {
                 i += 1;
             }
 
-            if j == self.adj.len() {
+            if j == self.neighbors.len() {
                 break;
             }
 
@@ -201,7 +202,7 @@ impl Node {
 
         self.insert_edge_buf.clear();
         self.delete_edge_buf.clear();
-        self.adj = l.into();
+        self.neighbors = l.into();
     }
 }
 
@@ -213,8 +214,10 @@ pub struct DNDTree {
     l_nodes: Vec<Rc<RefCell<LinkNode>>>,
 
     used: Vec<bool>,
-    q: Vec<i32>,
-    l: Vec<usize>,
+    vec_scratch_nodes: Vec<i32>,
+    vec_scratch_stack: Vec<usize>,
+    node_bitset_scratch0: FixedBitSet, // |nodes| len scratch area
+    node_bitset_scratch1: FixedBitSet, // |nodes| len scratch area
 
     use_union_find: bool,
 }
@@ -274,7 +277,7 @@ impl DNDTree {
             .map(|i| {
                 let mut node = Node::new();
                 for &j in adj_dict.get(&(i as i32)).unwrap_or(&IntSet::default()) {
-                    node.insert_adj(j);
+                    node.insert_neighbor(j);
                 }
                 node
             })
@@ -285,8 +288,10 @@ impl DNDTree {
             nodes,
             l_nodes: vec![],
             used: vec![],
-            q: vec![],
-            l: vec![],
+            vec_scratch_nodes: vec![],
+            vec_scratch_stack: vec![],
+            node_bitset_scratch0: FixedBitSet::with_capacity(n),
+            node_bitset_scratch1: FixedBitSet::with_capacity(n),
             use_union_find,
         }
     }
@@ -299,7 +304,7 @@ impl DNDTree {
         self.used = vec![false; n];
         for i in 0..n {
             self.nodes[i].flush();
-            let length = self.nodes[i].adj.len() as i32;
+            let length = self.nodes[i].neighbors.len() as i32;
             s.push((length, -(i as i32)));
         }
         s.sort();
@@ -332,22 +337,22 @@ impl DNDTree {
             if self.used[f] {
                 continue;
             }
-            self.q.clear();
+            self.vec_scratch_nodes.clear();
             self.used[f] = true;
-            self.q.push(f as i32);
+            self.vec_scratch_nodes.push(f as i32);
 
             if use_union_find {
                 self.nodes[f].insert_l_node(self.l_nodes[f].clone());
             }
 
             let mut s_index = 0;
-            while s_index < self.q.len() {
-                let p = self.q[s_index];
-                for j in 0..self.nodes[p as usize].adj.len() {
-                    let v = self.nodes[p as usize].adj[j] as usize;
+            while s_index < self.vec_scratch_nodes.len() {
+                let p = self.vec_scratch_nodes[s_index];
+                for j in 0..self.nodes[p as usize].neighbors.len() {
+                    let v = self.nodes[p as usize].neighbors[j] as usize;
                     if !self.used[v] {
                         self.used[v] = true;
-                        self.q.push(v as i32);
+                        self.vec_scratch_nodes.push(v as i32);
                         self.nodes[v].parent = p as i32;
                         if use_union_find {
                             self.nodes[v].root = f as i32;
@@ -358,19 +363,21 @@ impl DNDTree {
                 s_index += 1;
             }
 
-            let mut i = self.q.len() - 1;
+            let mut i = self.vec_scratch_nodes.len() - 1;
             while i > 0 {
-                let q_idx = self.q[i as usize] as usize;
+                let q_idx = self.vec_scratch_nodes[i as usize] as usize;
                 let p_idx = self.nodes[q_idx].parent as usize;
                 self.nodes[p_idx].subtree_size += self.nodes[q_idx].subtree_size;
                 i -= 1;
             }
 
             let mut r: i32 = -1;
-            let ss = self.q.len() / 2;
-            for i in (0..self.q.len()).rev() {
-                if r == -1 && self.nodes[self.q[i] as usize].subtree_size as usize > ss {
-                    r = self.q[i] as i32;
+            let ss = self.vec_scratch_nodes.len() / 2;
+            for i in (0..self.vec_scratch_nodes.len()).rev() {
+                if r == -1
+                    && self.nodes[self.vec_scratch_nodes[i] as usize].subtree_size as usize > ss
+                {
+                    r = self.vec_scratch_nodes[i] as i32;
                 }
             }
             if r != f as i32 {
@@ -384,8 +391,8 @@ impl DNDTree {
         if u >= self.n || v >= self.n || u == v {
             return false;
         }
-        self.nodes[u].insert_adj(v as i32);
-        self.nodes[v].insert_adj(u as i32);
+        self.nodes[u].insert_neighbor(v as i32);
+        self.nodes[v].insert_neighbor(u as i32);
         true
     }
 
@@ -570,34 +577,35 @@ impl DNDTree {
     }
 
     fn find_replacement(&mut self, u: usize, f: usize) -> bool {
-        // println!("Entered find_replacement! {} {}", u, f);
-        self.q.clear();
-        self.l.clear();
+        let used = &mut self.node_bitset_scratch0;
 
-        self.q.push(u as i32);
-        self.l.push(u);
-        self.used[u] = true;
+        self.vec_scratch_nodes.clear();
+        self.vec_scratch_stack.clear();
+        used.clear();
+
+        self.vec_scratch_nodes.push(u as i32);
+        self.vec_scratch_stack.push(u);
+        used.insert(u);
 
         let mut i = 0;
-        while i < self.q.len() {
-            let mut x = self.q[i];
+        while i < self.vec_scratch_nodes.len() {
+            let mut node = self.vec_scratch_nodes[i];
             i += 1;
 
-            self.nodes[x as usize].flush();
+            self.nodes[node as usize].flush();
 
             let mut j = 0;
-            while j < self.nodes[x as usize].adj.len() {
-                let y = self.nodes[x as usize].adj[j];
-                if y == self.nodes[x as usize].parent {
+            while j < self.nodes[node as usize].neighbors.len() {
+                let neighbor = self.nodes[node as usize].neighbors[j];
+                if neighbor == self.nodes[node as usize].parent {
                     j += 1;
                     continue;
                 }
 
-                if self.nodes[y as usize].parent == x as i32 {
-                    self.q.push(y);
-                    if !self.used[y as usize] {
-                        self.used[y as usize] = true;
-                        self.l.push(y as usize);
+                if self.nodes[neighbor as usize].parent == node as i32 {
+                    self.vec_scratch_nodes.push(neighbor);
+                    if !used.put(neighbor as usize) {
+                        self.vec_scratch_stack.push(neighbor as usize);
                     }
                     j += 1;
                     continue;
@@ -605,15 +613,13 @@ impl DNDTree {
 
                 // Try to build a new path from y upward
                 let mut succ = true;
-                let mut w = y;
+                let mut w = neighbor;
                 while w != -1 {
-                    if self.used[w as usize] {
+                    if used.put(w as usize) {
                         succ = false;
                         break;
                     }
-                    self.used[w as usize] = true;
-                    self.l.push(w as usize);
-
+                    self.vec_scratch_stack.push(w as usize);
                     w = self.nodes[w as usize].parent;
                 }
                 if !succ {
@@ -621,54 +627,150 @@ impl DNDTree {
                     continue;
                 }
 
-                // Reconnect path from x to y
-                let mut p = self.nodes[x as usize].parent;
-                self.nodes[x as usize].parent = y as i32;
+                // Reconnect path from node to neighbor
+                let mut p = self.nodes[node as usize].parent;
+                self.nodes[node as usize].parent = neighbor as i32;
                 while p != -1 {
                     let pp = self.nodes[p as usize].parent;
-                    self.nodes[p as usize].parent = x;
-                    x = p;
+                    self.nodes[p as usize].parent = node;
+                    node = p;
                     p = pp;
                 }
 
                 // Compute new root
                 let s = (self.nodes[f].subtree_size + self.nodes[u].subtree_size) / 2;
-                let mut r = None;
-
-                let mut p = y as i32;
+                let mut new_root = None;
+                let mut p = neighbor as i32;
                 while p != -1 {
                     self.nodes[p as usize].subtree_size += self.nodes[u].subtree_size;
-                    if r.is_none() && self.nodes[p as usize].subtree_size > s {
-                        r = Some(p as usize);
+                    if new_root.is_none() && self.nodes[p as usize].subtree_size > s {
+                        new_root = Some(p as usize);
                     }
                     p = self.nodes[p as usize].parent;
                 }
 
                 // Fix subtree sizes
-                let mut p = self.nodes[x as usize].parent;
-                while p != y as i32 {
-                    self.nodes[x as usize].subtree_size -= self.nodes[p as usize].subtree_size;
-                    self.nodes[p as usize].subtree_size += self.nodes[x as usize].subtree_size;
-                    x = p;
+                let mut p = self.nodes[node as usize].parent;
+                while p != neighbor as i32 {
+                    self.nodes[node as usize].subtree_size -= self.nodes[p as usize].subtree_size;
+                    self.nodes[p as usize].subtree_size += self.nodes[node as usize].subtree_size;
+                    node = p;
                     p = self.nodes[p as usize].parent;
                 }
 
-                for &k in &self.l {
-                    self.used[k] = false;
+                for &k in &self.vec_scratch_stack {
+                    used.remove(k);
                 }
 
-                if r != Some(f) {
-                    self.reroot(r.unwrap(), f as i32);
+                if new_root != Some(f) {
+                    self.reroot(new_root.unwrap(), f as i32);
                 }
 
                 return true;
             }
         }
 
-        for &k in &self.l {
-            self.used[k] = false;
+        for &k in &self.vec_scratch_stack {
+            used.remove(k);
         }
 
+        false
+    }
+
+    fn _find_replacement(&mut self, u: usize, root_v: usize) -> bool {
+        let nodes = &mut self.nodes;
+        let stack = &mut self.vec_scratch_stack;
+        let used = &mut self.node_bitset_scratch0;
+
+        // 5 𝑄 ← an empty queue, 𝑄.𝑝𝑢𝑠ℎ(𝑢);
+        stack.clear();
+        used.clear();
+
+        stack.push(u);
+        used.insert(u);
+
+        //  7 while 𝑄 ≠ ∅ do
+        while let Some(mut node) = stack.pop() {
+            nodes[node].flush();
+
+            //  9 foreach 𝑦 ∈ 𝑁(𝑥) do
+            'neighbors: for neighbor in nodes[node].neighbors.iter().filter_map(|n| {
+                // 10 if 𝑦 = 𝑝𝑎𝑟𝑒𝑛𝑡(𝑥) then continue;
+                if *n == nodes[node].parent {
+                    None
+                } else {
+                    Some(*n as usize)
+                }
+            }) {
+                // 11 else if 𝑥 = 𝑝𝑎𝑟𝑒𝑛𝑡(𝑦) then
+                // 12 𝑄.𝑝𝑢𝑠ℎ(𝑦);
+                // 13 𝑆 ← 𝑆 ∪ {𝑦};
+                if node as i32 == nodes[neighbor].parent {
+                    if !used.put(neighbor) {
+                        stack.push(neighbor);
+                    }
+                    continue;
+                }
+
+                // Try to build a new path from y upward
+                // 15 𝑠𝑢𝑐𝑐 ← true;
+                // 16 foreach 𝑤 from 𝑦 to the root do
+                // 17 if 𝑤 ∈ 𝑆 then
+                // 18  𝑠𝑢𝑐𝑐 ← false;
+                // 19  break
+                // 20 else
+                // 21  𝑆 ← 𝑆 ∪ {𝑤};
+                let mut w = neighbor as i32;
+                while w != -1 {
+                    if used.put(w as usize) {
+                        continue 'neighbors;
+                    }
+                    w = nodes[w as usize].parent;
+                }
+
+                // 22 if 𝑠𝑢𝑐𝑐 then
+                // 23   𝑟𝑜𝑜𝑡𝑣 ← Link(ReRoot(𝑥),𝑦,𝑟𝑜𝑜𝑡𝑣);
+                // Compute new root => update subtree sizes and find new root
+                // Reconnect path from node to neighbor
+                let mut p = nodes[node].parent;
+                nodes[node].parent = neighbor as i32;
+                while p != -1 {
+                    let pp = nodes[p as usize].parent;
+                    nodes[p as usize].parent = node as i32;
+                    node = p as usize;
+                    p = pp;
+                }
+
+                // Compute new root
+                let subtree_u_size = nodes[u].subtree_size;
+                let s = (nodes[root_v].subtree_size + subtree_u_size) / 2;
+                let mut new_root = None;
+                let mut p = neighbor as i32;
+                while p != -1 {
+                    nodes[p as usize].subtree_size += subtree_u_size;
+                    if new_root.is_none() && nodes[p as usize].subtree_size > s {
+                        new_root = Some(p as usize);
+                    }
+                    p = nodes[p as usize].parent;
+                }
+
+                // Fix subtree sizes
+                let mut p = nodes[node].parent;
+                while p != neighbor as i32 {
+                    nodes[node].subtree_size -= nodes[p as usize].subtree_size;
+                    nodes[p as usize].subtree_size += nodes[node].subtree_size;
+                    node = p as usize;
+                    p = nodes[p as usize].parent;
+                }
+
+                if let Some(new_root) = new_root
+                    && new_root != root_v
+                {
+                    self.reroot(new_root, root_v as i32);
+                }
+                return true;
+            }
+        }
         false
     }
 
@@ -713,9 +815,8 @@ impl DNDTree {
     fn remove_subtree_union_find(&mut self, u: usize, v: usize, _need_reroot: bool) {
         let fv = v;
         let mut i = 0;
-        while i < self.q.len() {
-            let x = self.q[i];
-
+        while i < self.vec_scratch_nodes.len() {
+            let x = self.vec_scratch_nodes[i];
             let l_start_next = self.nodes[x as usize].children_start.borrow().next.clone();
             let l_end = self.nodes[x as usize].children_end.clone();
             if let Some(mut curr) = l_start_next {
@@ -739,12 +840,48 @@ impl DNDTree {
                     a.insert_l_nodes(b);
                 }
             }
-
             i += 1;
         }
 
-        for i in 0..self.q.len() {
-            let x = self.q[i];
+        for i in 0..self.vec_scratch_nodes.len() {
+            let x = self.vec_scratch_nodes[i];
+            self.nodes[x as usize].root = u as i32;
+            self.l_nodes[x as usize].borrow_mut().isolate();
+            self.nodes[u as usize].insert_l_node(self.l_nodes[x as usize].clone());
+            self.nodes[x as usize].root = u as i32;
+        }
+    }
+
+    fn _remove_subtree_union_find(&mut self, u: usize, v: usize, _need_reroot: bool) {
+        let fv = v;
+        for x in self.node_bitset_scratch0.ones() {
+            let l_start_next = self.nodes[x as usize].children_start.borrow().next.clone();
+            let l_end = self.nodes[x as usize].children_end.clone();
+            if let Some(mut curr) = l_start_next {
+                if !Rc::ptr_eq(&curr, &l_end) {
+                    while !Rc::ptr_eq(&curr, &l_end) {
+                        let y_v = curr.borrow().v as usize;
+                        self.nodes[y_v].root = fv as i32;
+
+                        let next = { curr.borrow().next.clone() };
+                        curr = next.unwrap();
+                    }
+
+                    let (a, b) = if fv < x as usize {
+                        let (left, right) = self.nodes.split_at_mut(x as usize);
+                        (&mut left[fv], &right[0])
+                    } else {
+                        let (left, right) = self.nodes.split_at_mut(fv);
+                        (&mut right[0], &left[x as usize])
+                    };
+
+                    a.insert_l_nodes(b);
+                }
+            }
+        }
+
+        for x in self.node_bitset_scratch0.ones() {
+            self.nodes[x as usize].root = u as i32;
             self.l_nodes[x as usize].borrow_mut().isolate();
             self.nodes[u as usize].insert_l_node(self.l_nodes[x as usize].clone());
             self.nodes[x as usize].root = u as i32;
