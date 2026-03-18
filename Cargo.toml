@@ -11,6 +11,9 @@ documentation = "https://docs.rs/dndtree"
 name = "dndtree"
 crate-type = ["rlib", "cdylib"]
 
+[profile.release]
+debug = true
+
 [dependencies]
 fixedbitset = "0.5"
 nohash-hasher = "0.2.0"
