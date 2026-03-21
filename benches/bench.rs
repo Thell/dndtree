@@ -6,7 +6,6 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
 const ARGS: &[usize] = &[1_000, 2_000, 10_000, 20_000, 100_000, 200_000];
-// const ARGS: &[usize] = &[400_000, 600_000];
 const SAMPLE_COUNT: u32 = 10;
 const QUERY_FACTOR: f64 = 0.05;
 
