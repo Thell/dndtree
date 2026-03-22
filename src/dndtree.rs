@@ -77,11 +77,10 @@ pub struct DNDTree {
     n: usize,
     nodes: Vec<Node>,
 
-    l_nodes: Vec<Link>,            // big flat vec, size == n, index == node id
+    l_nodes: Vec<Link>,
     root_head: Vec<Option<usize>>, // for each possible root: index of first real child in its list
     root_tail: Vec<Option<usize>>, // last real child (optional, helps splicing sometimes)
 
-    // used: Vec<bool>,
     vec_scratch_nodes: Vec<usize>,
     vec_scratch_stack: Vec<usize>,
     generation: u16,
@@ -271,6 +270,12 @@ impl DNDTree {
                 None
             }
         })
+    }
+
+    #[inline(always)]
+    fn node(&self, i: usize) -> &Node {
+        debug_assert!(i < self.n);
+        unsafe { self.nodes.get_unchecked(i) }
     }
 
     #[inline(always)]
@@ -663,27 +668,9 @@ impl DNDTree {
         false
     }
 
-    #[inline(always)]
-    // fn get_tree_root(&mut self, u: usize) -> usize {
-    //     let mut root = u;
-    //     while self.nodes[root].parent != usize::MAX {
-    //         root = self.nodes[root].parent;
-    //     }
-    //
-    //     let mut cur = u;
-    //     while cur != root {
-    //         let p = self.nodes[cur].parent;
-    //         if p != root {
-    //             self.nodes[cur].parent = self.nodes[p].parent;
-    //         }
-    //         cur = p;
-    //     }
-    //
-    //     root
-    // }
     fn get_tree_root(&mut self, u: usize) -> usize {
         let mut root = u;
-        while self.nodes[root].parent != usize::MAX {
+        while self.node(root).parent != usize::MAX {
             root = self.nodes[root].parent;
         }
         root
@@ -692,14 +679,14 @@ impl DNDTree {
     #[inline(always)]
     fn get_dsu_root(&mut self, u: usize) -> usize {
         let mut root = u;
-        while self.nodes[root].root != root {
-            root = self.nodes[root].root;
+        while self.node(root).root != root {
+            root = self.node(root).root;
         }
 
         if self.compress_links {
             // Strong mode: full flattening + relocate every node to root's list
             let mut cur = u;
-            while self.nodes[cur].root != root {
+            while self.node(cur).root != root {
                 let next = self.nodes[cur].root;
 
                 self.isolate_link(cur);
@@ -711,7 +698,7 @@ impl DNDTree {
         } else {
             // Weak mode: apply halving instead of direct-to-root
             let mut cur = u;
-            while self.nodes[cur].root != root {
+            while self.node(cur).root != root {
                 let next = self.nodes[cur].root;
                 let grandparent = self.nodes[next].root;
                 self.nodes[cur].root = grandparent;

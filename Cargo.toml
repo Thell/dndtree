@@ -17,6 +17,7 @@ debug = true
 [dependencies]
 fixedbitset = "0.5"
 nohash-hasher = "0.2.0"
+nonmax = "0.5.5"
 smallvec = "1.15.1"
 
 [dev-dependencies]
