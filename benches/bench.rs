@@ -1,879 +1,423 @@
-use divan::Bencher;
+/*
+   The API being benched is:
+
+   /// Creating a new Tree
+   ///   using an adjacency list
+   ///   inserting edge by edge into an empty tree
+
+   /// Inserting an edge
+   /// Returns:
+   ///   -1 if the edge is invalid
+   ///   0 if the edge inserted was a non-tree edge
+   ///   1 if the edge inserted was a tree edge
+   ///   2 if the edge inserted was a non-tree edge triggering a reroot
+   ///   3 if the edge inserted was a tree edge triggering a reroot
+
+   /// Deleting an edge
+   /// Returns:
+   ///   -1 if the edge is invalid
+   ///   0 if the edge deleted was a non-tree edge
+   ///   1 if the edge deleted was a tree edge (a new component is created)
+   ///   2 if the edge deleted was a tree edge and a replacement edge was found
+
+   /// Methodology (Insertion benching):
+   Testing the insertion of the edges poses a bit of a challenge since each insertion modifies
+   the state of the tree and benching a single insertion is not sufficient. To isolate the edges
+   to use during the bench the full graph is generated and each edge insertion is classified by
+   its type (tree, non-tree, reroot tree, reroot non-tree).
+
+   These edges are then deleted and classified by their deletion type one at a time from a clone
+   of the tree thereby identifying isolated edges that have a low probability of interacting with
+   other edges used for the bench.
+
+   Lastly, for each vector of classified deleted edges, these edges are again deleted one at a time
+   from a single clone of the tree and the ones that retain the same classification are used for
+   the bench by starting with a fresh tree and then deleting the edges outside of the benching
+   loop and then inserting the edges inside the benching loop.
+
+   /// Methodology (Deletion benching):
+   The same initial methodology is used as for the insertion benching except that the final step
+   of the benching loop is to delete the edges inside the benching loop and skip the insertion.
+
+   /// Querying an edge
+   /// NOTES:
+   ///   ID-Tree: always traverses parents to find the roots
+   ///   DND-Tree: traverses roots when the path has not been compressed
+   ///   DND-Tree: with link compression traverses the roots when the path has not been compressed
+   ///            and compresses the DSU link list as well.
+   /// Returns:
+   ///   True if the edge ends are connected
+   ///   False if the edge ends are not connected
+*/
+use std::env;
+use std::fmt;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
+use std::time::Instant;
+
 use dndtree::DNDTree;
+use hdrhistogram::Histogram;
 use nohash_hasher::{IntMap, IntSet};
-use rand::prelude::SliceRandom;
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
+use rand::prelude::*;
+use statrs::statistics::Statistics;
 
-const ARGS: &[usize] = &[
-    1_000, 2_000, 10_000, 20_000, 100_000, 200_000, 400_000, 600_000,
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum TaskVariant {
+    DNDTreeNoDSU,
+    DNDTree,
+}
+
+impl TaskVariant {
+    fn name(&self) -> &'static str {
+        match self {
+            TaskVariant::DNDTreeNoDSU => "DNDTreeNoDSU",
+            TaskVariant::DNDTree => "DNDTree",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Task {
+    variant: TaskVariant,
+    use_union_find: bool,
+}
+
+impl fmt::Display for Task {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.variant.name())
+    }
+}
+
+const TASKS: [Task; 2] = [
+    Task {
+        variant: TaskVariant::DNDTreeNoDSU,
+        use_union_find: false,
+    },
+    Task {
+        variant: TaskVariant::DNDTree,
+        use_union_find: true,
+    },
 ];
-const SAMPLE_COUNT: u32 = 10;
-const QUERY_FACTOR: f64 = 0.05;
 
-fn make_adj(n: usize) -> IntMap<i32, IntSet<i32>> {
-    let mut adj: IntMap<i32, IntSet<i32>> = IntMap::default();
-    for i in 0..n {
-        adj.insert(i as i32, IntSet::default());
-    }
-    adj
+// MARK: Reporting
+
+#[derive(Debug, Clone, Copy)]
+enum OpType {
+    Insertion,
+    QueryCold,
+    QueryWarm,
+    Deletion,
 }
 
-fn make_edges(n: usize) -> Vec<(usize, usize)> {
-    let mut edges = Vec::with_capacity(n);
-    for i in 0..n {
-        let u = i % n;
-        let v = (i * 7 + 13) % n;
-        if u != v {
-            edges.push((u, v));
+impl fmt::Display for OpType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OpType::Insertion => write!(f, "INSERTION"),
+            OpType::QueryCold => write!(f, "QUERY (COLD)"),
+            OpType::QueryWarm => write!(f, "QUERY (WARM)"),
+            OpType::Deletion => write!(f, "DELETION"),
         }
-    }
-    edges
-}
-
-fn make_edges_for_nodes(node_count: usize, edge_count: usize) -> Vec<(usize, usize)> {
-    let mut edges = Vec::with_capacity(edge_count);
-    for i in 0..edge_count {
-        let u = i % node_count;
-        let v = (i * 7 + 13) % node_count;
-        if u != v {
-            edges.push((u, v));
-        }
-    }
-    edges
-}
-
-fn make_caterpillar_graph(
-    n: usize,
-    spine_length_ratio: f64, // 0.1 = short spine, 0.5 = half nodes on spine
-    extra_edges_ratio: f64,  // how many additional random chords
-) -> IntMap<i32, IntSet<i32>> {
-    let mut adj: IntMap<i32, IntSet<i32>> = IntMap::default();
-    for i in 0..n as i32 {
-        adj.insert(i, IntSet::default());
-    }
-
-    let mut rng = StdRng::seed_from_u64(42);
-
-    // 1. Create the long spine (backbone path)
-    let spine_len = (n as f64 * spine_length_ratio).max(10.0).min(n as f64) as usize;
-    let mut spine = Vec::with_capacity(spine_len);
-    for i in 0..spine_len {
-        spine.push(i as i32);
-        if i > 0 {
-            let prev = spine[i - 1];
-            adj.get_mut(&prev).unwrap().insert(i as i32);
-            adj.get_mut(&(i as i32)).unwrap().insert(prev);
-        }
-    }
-
-    // 2. Attach remaining nodes as leaves or small trees to the spine
-    let mut next_node = spine_len as i32;
-    while next_node < n as i32 {
-        // Pick random spine node to attach to
-        let attach_to = spine[rng.random_range(0..spine.len())];
-
-        // Attach a small chain (1–4 nodes) to make subtrees deeper
-        let chain_len = rng.random_range(1..=4);
-        let mut prev = attach_to;
-        for _ in 0..chain_len {
-            if next_node >= n as i32 {
-                break;
-            }
-            adj.get_mut(&prev).unwrap().insert(next_node);
-            adj.get_mut(&next_node).unwrap().insert(prev);
-            prev = next_node;
-            next_node += 1;
-        }
-    }
-
-    // 3. Add a few random chords (keep connectivity high but allow splits)
-    let extra_count = (n as f64 * extra_edges_ratio) as usize;
-    for _ in 0..extra_count {
-        let u = rng.random_range(0..n as i32);
-        let v = rng.random_range(0..n as i32);
-        if u != v && !adj.get(&u).unwrap().contains(&v) {
-            adj.get_mut(&u).unwrap().insert(v);
-            adj.get_mut(&v).unwrap().insert(u);
-        }
-    }
-
-    adj
-}
-
-fn make_random_recursive_tree(n: usize, extra_chords_ratio: f64) -> IntMap<i32, IntSet<i32>> {
-    let mut adj: IntMap<i32, IntSet<i32>> = IntMap::default();
-    for i in 0..n as i32 {
-        adj.insert(i, IntSet::default());
-    }
-
-    let mut rng = StdRng::seed_from_u64(42);
-
-    // Root is 0
-    let mut parents = vec![-1i32; n];
-    parents[0] = 0; // self-root
-
-    // Build recursive tree: each new node attaches to a random existing node
-    for i in 1..n as i32 {
-        let parent_idx = rng.random_range(0..i as usize);
-        let parent = parent_idx as i32;
-
-        adj.get_mut(&parent).unwrap().insert(i);
-        adj.get_mut(&i).unwrap().insert(parent);
-
-        parents[i as usize] = parent;
-    }
-
-    // Add extra random chords (keep graph connected but allow splits)
-    let extra_count = (n as f64 * extra_chords_ratio) as usize;
-    for _ in 0..extra_count {
-        let u = rng.random_range(0..n as i32);
-        let v = rng.random_range(0..n as i32);
-        if u != v && !adj.get(&u).unwrap().contains(&v) {
-            adj.get_mut(&u).unwrap().insert(v);
-            adj.get_mut(&v).unwrap().insert(u);
-        }
-    }
-
-    adj
-}
-
-mod with_union_find_and_compression {
-    use rand::RngExt;
-
-    use super::*;
-
-    const USE_DSU: bool = true;
-    const COMPRESS_LINKS: bool = true;
-
-    #[divan::bench(args = ARGS, sample_count = SAMPLE_COUNT)]
-    fn bench_build_from_adj(bencher: Bencher, n: usize) {
-        let mut adj = make_adj(n);
-        let edges = make_edges(n);
-
-        // populate adjacency list once
-        for &(u, v) in &edges {
-            adj.get_mut(&(u as i32)).unwrap().insert(v as i32);
-            adj.get_mut(&(v as i32)).unwrap().insert(u as i32);
-        }
-
-        bencher.with_inputs(|| adj.clone()).bench_refs(|adj| {
-            let _ = DNDTree::new(adj, USE_DSU, COMPRESS_LINKS);
-        });
-    }
-
-    #[divan::bench(args = ARGS, sample_count = SAMPLE_COUNT)]
-    fn bench_insert(bencher: Bencher, n: usize) {
-        let adj = make_adj(n);
-        let edges = make_edges(n);
-        let tree = DNDTree::new(&adj, USE_DSU, COMPRESS_LINKS);
-
-        bencher
-            .with_inputs(|| (edges.clone(), tree.clone()))
-            .bench_local_refs(|(edges, tree)| {
-                for (u, v) in edges {
-                    tree.insert_edge(*u, *v);
-                }
-            });
-    }
-
-    #[divan::bench(args = ARGS, sample_count = SAMPLE_COUNT)]
-    fn bench_query(bencher: Bencher, n: usize) {
-        let adj = make_adj(n);
-        let mut tree = DNDTree::new(&adj, USE_DSU, COMPRESS_LINKS);
-        let edges = make_edges(n);
-
-        // populate once
-        for &(u, v) in &edges {
-            tree.insert_edge(u, v);
-        }
-
-        bencher.bench_local(move || {
-            for &(u, v) in &edges {
-                let _ = tree.query(u, v);
-            }
-        });
-    }
-
-    #[divan::bench(args = ARGS, sample_count = SAMPLE_COUNT)]
-    fn bench_delete(bencher: Bencher, n: usize) {
-        let adj = make_adj(n);
-        let mut tree = DNDTree::new(&adj, USE_DSU, COMPRESS_LINKS);
-        let edges = make_edges(n);
-
-        // populate once
-        for &(u, v) in &edges {
-            tree.insert_edge(u, v);
-        }
-
-        bencher
-            .with_inputs(|| (edges.clone(), tree.clone()))
-            .bench_local_refs(|(edges, tree)| {
-                for (u, v) in edges {
-                    tree.delete_edge(*u, *v);
-                }
-            });
-    }
-
-    #[divan::bench(args = ARGS, sample_count = SAMPLE_COUNT)]
-    fn mixed_ops(bencher: Bencher, n: usize) {
-        let mut edges = make_edges(n * 2);
-        let mut rng = StdRng::seed_from_u64(12345);
-        edges.shuffle(&mut rng);
-
-        let (present, absent) = edges.split_at_mut(n);
-
-        let mut adj = make_adj(n * 2);
-        for &(u, v) in present.iter() {
-            adj.get_mut(&(u as i32)).unwrap().insert(v as i32);
-            adj.get_mut(&(v as i32)).unwrap().insert(u as i32);
-        }
-
-        bencher.bench_local(move || {
-            let mut tree = DNDTree::new(&adj, USE_DSU, COMPRESS_LINKS);
-
-            for i in 0..n {
-                let (du, dv) = present[i];
-                tree.delete_edge(du, dv);
-
-                let (qu, qv) = present[i % present.len()];
-                let _ = tree.query(qu, qv);
-
-                let (iu, iv) = absent[i];
-                tree.insert_edge(iu, iv);
-            }
-        });
-    }
-
-    #[divan::bench(args = ARGS, sample_count = 1)]
-    fn mixed_ops_query_heavy(bencher: Bencher, n: usize) {
-        let mut edges = make_edges_for_nodes(n, n * 2);
-        let mut rng = StdRng::seed_from_u64(12345);
-        edges.shuffle(&mut rng);
-
-        let (present_edges, absent_edges) = edges.split_at(n);
-
-        let mut adj = make_adj(n);
-        for &(u, v) in present_edges.iter() {
-            adj.get_mut(&(u as i32)).unwrap().insert(v as i32);
-            adj.get_mut(&(v as i32)).unwrap().insert(u as i32);
-        }
-
-        // Pre-select random endpoint pairs (not edges)
-        let num_query_pairs = (QUERY_FACTOR * n as f64) as usize;
-        let mut query_pairs = Vec::with_capacity(num_query_pairs);
-        for _ in 0..num_query_pairs {
-            let qu = rng.random_range(0..n);
-            let qv = rng.random_range(0..n);
-            query_pairs.push((qu, qv));
-        }
-
-        bencher.bench_local(move || {
-            let mut tree = DNDTree::new(&adj, USE_DSU, COMPRESS_LINKS);
-
-            let mut present: Vec<usize> = (0..n).collect();
-            let mut absent: Vec<usize> = (0..n).collect();
-
-            for i in 0..n {
-                let pi = present[i];
-                let (du, dv) = present_edges[pi];
-                tree.delete_edge(du, dv);
-
-                for &(qu, qv) in &query_pairs {
-                    let _ = tree.query(qu, qv);
-                }
-
-                let ai = absent[i];
-                let (iu, iv) = absent_edges[ai];
-                tree.insert_edge(iu, iv);
-
-                present[i] = ai;
-                absent[i] = pi;
-            }
-        });
-    }
-
-    #[divan::bench(args = ARGS, sample_count = 1)]
-    fn mixed_ops_query_heavy_catgraph(bencher: Bencher, n: usize) {
-        let mut edges = make_edges_for_nodes(n, n * 2);
-        let mut rng = StdRng::seed_from_u64(12345);
-        edges.shuffle(&mut rng);
-
-        let (present_edges, absent_edges) = edges.split_at(n);
-
-        // Replace the adj creation line in mixed_ops_query_heavy
-        let adj = make_caterpillar_graph(n, 0.3, 0.05); // spine ~30% of nodes, 5% extra chords
-
-        // Pre-select random endpoint pairs (not edges)
-        let num_query_pairs = (QUERY_FACTOR * n as f64) as usize;
-        let mut query_pairs = Vec::with_capacity(num_query_pairs);
-        for _ in 0..num_query_pairs {
-            let qu = rng.random_range(0..n);
-            let qv = rng.random_range(0..n);
-            query_pairs.push((qu, qv));
-        }
-
-        bencher.bench_local(move || {
-            let mut tree = DNDTree::new(&adj, USE_DSU, COMPRESS_LINKS);
-
-            let mut present: Vec<usize> = (0..n).collect();
-            let mut absent: Vec<usize> = (0..n).collect();
-
-            for i in 0..n {
-                let pi = present[i];
-                let (du, dv) = present_edges[pi];
-                tree.delete_edge(du, dv);
-
-                for &(qu, qv) in &query_pairs {
-                    let _ = tree.query(qu, qv);
-                }
-
-                let ai = absent[i];
-                let (iu, iv) = absent_edges[ai];
-                tree.insert_edge(iu, iv);
-
-                present[i] = ai;
-                absent[i] = pi;
-            }
-        });
-    }
-
-    #[divan::bench(args = ARGS, sample_count = 1)]
-    fn mixed_ops_query_heavy_tree(bencher: Bencher, n: usize) {
-        let mut edges = make_edges_for_nodes(n, n * 2);
-        let mut rng = StdRng::seed_from_u64(12345);
-        edges.shuffle(&mut rng);
-
-        let (present_edges, absent_edges) = edges.split_at(n);
-
-        let adj = make_random_recursive_tree(n, 0.05); // or 0.1 for more chords
-
-        // Pre-select random endpoint pairs (not edges)
-        let num_query_pairs = (QUERY_FACTOR * n as f64) as usize;
-        let mut query_pairs = Vec::with_capacity(num_query_pairs);
-        for _ in 0..num_query_pairs {
-            let qu = rng.random_range(0..n);
-            let qv = rng.random_range(0..n);
-            query_pairs.push((qu, qv));
-        }
-
-        bencher.bench_local(move || {
-            let mut tree = DNDTree::new(&adj, USE_DSU, COMPRESS_LINKS);
-
-            let mut present: Vec<usize> = (0..n).collect();
-            let mut absent: Vec<usize> = (0..n).collect();
-
-            for i in 0..n {
-                let pi = present[i];
-                let (du, dv) = present_edges[pi];
-                tree.delete_edge(du, dv);
-
-                for &(qu, qv) in &query_pairs {
-                    let _ = tree.query(qu, qv);
-                }
-
-                let ai = absent[i];
-                let (iu, iv) = absent_edges[ai];
-                tree.insert_edge(iu, iv);
-
-                present[i] = ai;
-                absent[i] = pi;
-            }
-        });
     }
 }
 
-mod with_union_find_no_compression {
-    use rand::RngExt;
+fn report(task: Task, sample_data: Vec<Vec<Vec<(i32, usize)>>>) {
+    println!("\nTASK: {}", task);
 
-    use super::*;
+    let op_types = [
+        OpType::Insertion,
+        OpType::QueryCold,
+        OpType::QueryWarm,
+        OpType::Deletion,
+    ];
 
-    const USE_DSU: bool = true;
-    const COMPRESS_LINKS: bool = false;
+    for (op_idx, op_type) in op_types.iter().enumerate() {
+        let mut raw_nanos_map: IntMap<i32, Vec<usize>> = IntMap::default();
 
-    #[divan::bench(args = ARGS, sample_count = SAMPLE_COUNT)]
-    fn bench_build_from_adj(bencher: Bencher, n: usize) {
-        let mut adj = make_adj(n);
-        let edges = make_edges(n);
-
-        // populate adjacency list once
-        for &(u, v) in &edges {
-            adj.get_mut(&(u as i32)).unwrap().insert(v as i32);
-            adj.get_mut(&(v as i32)).unwrap().insert(u as i32);
-        }
-
-        bencher.with_inputs(|| adj.clone()).bench_refs(|adj| {
-            let _ = DNDTree::new(adj, USE_DSU, COMPRESS_LINKS);
-        });
-    }
-
-    #[divan::bench(args = ARGS, sample_count = SAMPLE_COUNT)]
-    fn bench_insert(bencher: Bencher, n: usize) {
-        let adj = make_adj(n);
-        let edges = make_edges(n);
-        let tree = DNDTree::new(&adj, USE_DSU, COMPRESS_LINKS);
-
-        bencher
-            .with_inputs(|| (edges.clone(), tree.clone()))
-            .bench_local_refs(|(edges, tree)| {
-                for (u, v) in edges {
-                    tree.insert_edge(*u, *v);
+        for sample in &sample_data {
+            if let Some(trace) = sample.get(op_idx) {
+                for &(code, nanos) in trace {
+                    raw_nanos_map.entry(code).or_default().push(nanos);
                 }
-            });
-    }
-
-    #[divan::bench(args = ARGS, sample_count = SAMPLE_COUNT)]
-    fn bench_query(bencher: Bencher, n: usize) {
-        let adj = make_adj(n);
-        let mut tree = DNDTree::new(&adj, USE_DSU, COMPRESS_LINKS);
-        let edges = make_edges(n);
-
-        // populate once
-        for &(u, v) in &edges {
-            tree.insert_edge(u, v);
-        }
-
-        bencher.bench_local(move || {
-            for &(u, v) in &edges {
-                let _ = tree.query(u, v);
             }
-        });
-    }
-
-    #[divan::bench(args = ARGS, sample_count = SAMPLE_COUNT)]
-    fn bench_delete(bencher: Bencher, n: usize) {
-        let adj = make_adj(n);
-        let mut tree = DNDTree::new(&adj, USE_DSU, COMPRESS_LINKS);
-        let edges = make_edges(n);
-
-        // populate once
-        for &(u, v) in &edges {
-            tree.insert_edge(u, v);
         }
 
-        bencher
-            .with_inputs(|| (edges.clone(), tree.clone()))
-            .bench_local_refs(|(edges, tree)| {
-                for (u, v) in edges {
-                    tree.delete_edge(*u, *v);
-                }
-            });
-    }
-
-    #[divan::bench(args = ARGS, sample_count = SAMPLE_COUNT)]
-    fn mixed_ops(bencher: Bencher, n: usize) {
-        let mut edges = make_edges(n * 2);
-        let mut rng = StdRng::seed_from_u64(12345);
-        edges.shuffle(&mut rng);
-
-        let (present, absent) = edges.split_at_mut(n);
-
-        let mut adj = make_adj(n * 2);
-        for &(u, v) in present.iter() {
-            adj.get_mut(&(u as i32)).unwrap().insert(v as i32);
-            adj.get_mut(&(v as i32)).unwrap().insert(u as i32);
+        if raw_nanos_map.is_empty() {
+            continue;
         }
 
-        bencher.bench_local(move || {
-            let mut tree = DNDTree::new(&adj, USE_DSU, COMPRESS_LINKS);
+        println!("--- {} ---", op_type);
+        println!(
+            "{:<24} | {:<8} | {:<10} | {:<10} | {:<8} | {:<8} | {:<8}",
+            "Result Type", "Count", "Mean (ns)", "StdDev", "P50", "P99", "Max"
+        );
+        println!("{}", "-".repeat(90));
 
-            for i in 0..n {
-                let (du, dv) = present[i];
-                tree.delete_edge(du, dv);
+        let mut sorted_codes: Vec<_> = raw_nanos_map.keys().collect();
+        sorted_codes.sort();
 
-                let (qu, qv) = present[i % present.len()];
-                let _ = tree.query(qu, qv);
+        for &code in sorted_codes {
+            let nanos_vec = &raw_nanos_map[&code];
 
-                let (iu, iv) = absent[i];
-                tree.insert_edge(iu, iv);
+            let mut hist = Histogram::<u64>::new_with_bounds(1, 100_000_000, 3).unwrap();
+            let mut f64_samples: Vec<f64> = Vec::with_capacity(nanos_vec.len());
+
+            for &n in nanos_vec {
+                let _ = hist.record(n as u64);
+                f64_samples.push(n as f64);
             }
-        });
-    }
 
-    #[divan::bench(args = ARGS, sample_count = 1)]
-    fn mixed_ops_query_heavy(bencher: Bencher, n: usize) {
-        let mut edges = make_edges_for_nodes(n, n * 2);
-        let mut rng = StdRng::seed_from_u64(12345);
-        edges.shuffle(&mut rng);
+            let mean = f64_samples.as_slice().mean();
+            let std_dev = f64_samples.as_slice().std_dev();
 
-        let (present_edges, absent_edges) = edges.split_at(n);
+            // Map integer codes to descriptive labels based on OpType
+            let label = match op_type {
+                OpType::Insertion => match code {
+                    0 => "Non-Tree Edge",
+                    1 => "Tree Edge",
+                    2 => "Non-Tree Reroot",
+                    3 => "Tree Reroot",
+                    _ => "Invalid/Other",
+                },
+                OpType::Deletion => match code {
+                    0 => "Non-Tree Edge",
+                    1 => "Tree Edge (Split)",
+                    2 => "Tree Edge (Replaced)",
+                    _ => "Invalid/Other",
+                },
+                OpType::QueryCold | OpType::QueryWarm => match code {
+                    0 => "Disconnected",
+                    1 => "Connected",
+                    _ => "Invalid/Other",
+                },
+            };
 
-        let mut adj = make_adj(n);
-        for &(u, v) in present_edges.iter() {
-            adj.get_mut(&(u as i32)).unwrap().insert(v as i32);
-            adj.get_mut(&(v as i32)).unwrap().insert(u as i32);
+            println!(
+                "{:<24} | {:<8} | {:<10.2} | {:<10.2} | {:<8} | {:<8} | {:<8}",
+                label,
+                nanos_vec.len(),
+                mean,
+                std_dev,
+                hist.value_at_quantile(0.5),
+                hist.value_at_quantile(0.99),
+                hist.max()
+            );
         }
-
-        // Pre-select random endpoint pairs (not edges)
-        let num_query_pairs = (QUERY_FACTOR * n as f64) as usize;
-        let mut query_pairs = Vec::with_capacity(num_query_pairs);
-        for _ in 0..num_query_pairs {
-            let qu = rng.random_range(0..n);
-            let qv = rng.random_range(0..n);
-            query_pairs.push((qu, qv));
-        }
-
-        bencher.bench_local(move || {
-            let mut tree = DNDTree::new(&adj, USE_DSU, COMPRESS_LINKS);
-
-            let mut present: Vec<usize> = (0..n).collect();
-            let mut absent: Vec<usize> = (0..n).collect();
-
-            for i in 0..n {
-                let pi = present[i];
-                let (du, dv) = present_edges[pi];
-                tree.delete_edge(du, dv);
-
-                for &(qu, qv) in &query_pairs {
-                    let _ = tree.query(qu, qv);
-                }
-
-                let ai = absent[i];
-                let (iu, iv) = absent_edges[ai];
-                tree.insert_edge(iu, iv);
-
-                present[i] = ai;
-                absent[i] = pi;
-            }
-        });
-    }
-
-    #[divan::bench(args = ARGS, sample_count = 1)]
-    fn mixed_ops_query_heavy_catgraph(bencher: Bencher, n: usize) {
-        let mut edges = make_edges_for_nodes(n, n * 2);
-        let mut rng = StdRng::seed_from_u64(12345);
-        edges.shuffle(&mut rng);
-
-        let (present_edges, absent_edges) = edges.split_at(n);
-
-        // Replace the adj creation line in mixed_ops_query_heavy
-        let adj = make_caterpillar_graph(n, 0.3, 0.05); // spine ~30% of nodes, 5% extra chords
-
-        // Pre-select random endpoint pairs (not edges)
-        let num_query_pairs = (QUERY_FACTOR * n as f64) as usize;
-        let mut query_pairs = Vec::with_capacity(num_query_pairs);
-        for _ in 0..num_query_pairs {
-            let qu = rng.random_range(0..n);
-            let qv = rng.random_range(0..n);
-            query_pairs.push((qu, qv));
-        }
-
-        bencher.bench_local(move || {
-            let mut tree = DNDTree::new(&adj, USE_DSU, COMPRESS_LINKS);
-
-            let mut present: Vec<usize> = (0..n).collect();
-            let mut absent: Vec<usize> = (0..n).collect();
-
-            for i in 0..n {
-                let pi = present[i];
-                let (du, dv) = present_edges[pi];
-                tree.delete_edge(du, dv);
-
-                for &(qu, qv) in &query_pairs {
-                    let _ = tree.query(qu, qv);
-                }
-
-                let ai = absent[i];
-                let (iu, iv) = absent_edges[ai];
-                tree.insert_edge(iu, iv);
-
-                present[i] = ai;
-                absent[i] = pi;
-            }
-        });
-    }
-
-    #[divan::bench(args = ARGS, sample_count = 1)]
-    fn mixed_ops_query_heavy_tree(bencher: Bencher, n: usize) {
-        let mut edges = make_edges_for_nodes(n, n * 2);
-        let mut rng = StdRng::seed_from_u64(12345);
-        edges.shuffle(&mut rng);
-
-        let (present_edges, absent_edges) = edges.split_at(n);
-
-        let adj = make_random_recursive_tree(n, 0.05); // or 0.1 for more chords
-
-        // Pre-select random endpoint pairs (not edges)
-        let num_query_pairs = (QUERY_FACTOR * n as f64) as usize;
-        let mut query_pairs = Vec::with_capacity(num_query_pairs);
-        for _ in 0..num_query_pairs {
-            let qu = rng.random_range(0..n);
-            let qv = rng.random_range(0..n);
-            query_pairs.push((qu, qv));
-        }
-
-        bencher.bench_local(move || {
-            let mut tree = DNDTree::new(&adj, USE_DSU, COMPRESS_LINKS);
-
-            let mut present: Vec<usize> = (0..n).collect();
-            let mut absent: Vec<usize> = (0..n).collect();
-
-            for i in 0..n {
-                let pi = present[i];
-                let (du, dv) = present_edges[pi];
-                tree.delete_edge(du, dv);
-
-                for &(qu, qv) in &query_pairs {
-                    let _ = tree.query(qu, qv);
-                }
-
-                let ai = absent[i];
-                let (iu, iv) = absent_edges[ai];
-                tree.insert_edge(iu, iv);
-
-                present[i] = ai;
-                absent[i] = pi;
-            }
-        });
     }
 }
 
-mod without_union_find {
-    use rand::RngExt;
+// MARK: Data Preparation
+struct BenchData {
+    all_edges: Vec<(usize, usize)>,
+    empty_map: IntMap<i32, IntSet<i32>>,
+    id_tree: DNDTree,
+    dnd_tree: DNDTree,
+    query_id_tree: DNDTree,
+    query_dnd_tree: DNDTree,
+    query_edges: Vec<(usize, usize)>,
+}
 
-    use super::*;
-
-    const USE_DSU: bool = false;
-    const COMPRESS_LINKS: bool = false;
-
-    #[divan::bench(args = ARGS, sample_count = SAMPLE_COUNT)]
-    fn bench_build_from_adj(bencher: Bencher, n: usize) {
-        let mut adj = make_adj(n);
-        let edges = make_edges(n);
-
-        // populate adjacency list once
-        for &(u, v) in &edges {
-            adj.get_mut(&(u as i32)).unwrap().insert(v as i32);
-            adj.get_mut(&(v as i32)).unwrap().insert(u as i32);
-        }
-
-        bencher.with_inputs(|| adj.clone()).bench_refs(|adj| {
-            let _ = DNDTree::new(adj, USE_DSU, COMPRESS_LINKS);
-        });
-    }
-
-    #[divan::bench(args = ARGS, sample_count = SAMPLE_COUNT)]
-    fn bench_insert(bencher: Bencher, n: usize) {
-        let adj = make_adj(n);
-        let edges = make_edges(n);
-        let tree = DNDTree::new(&adj, USE_DSU, COMPRESS_LINKS);
-
-        bencher
-            .with_inputs(|| (edges.clone(), tree.clone()))
-            .bench_local_refs(|(edges, tree)| {
-                for (u, v) in edges {
-                    tree.insert_edge(*u, *v);
-                }
-            });
-    }
-
-    #[divan::bench(args = ARGS, sample_count = SAMPLE_COUNT)]
-    fn bench_query(bencher: Bencher, n: usize) {
-        let adj = make_adj(n);
-        let mut tree = DNDTree::new(&adj, USE_DSU, COMPRESS_LINKS);
-        let edges = make_edges(n);
-
-        // populate once
-        for &(u, v) in &edges {
-            tree.insert_edge(u, v);
-        }
-
-        bencher.bench_local(move || {
-            for &(u, v) in &edges {
-                let _ = tree.query(u, v);
+impl BenchData {
+    fn new(filename: &str) -> Self {
+        let adj_list = BenchData::load_graph(filename);
+        let mut adj_dict: IntMap<i32, IntSet<i32>> = IntMap::default();
+        for &u in adj_list.keys() {
+            adj_dict.entry(u).or_default();
+            for &v in adj_list.get(&u).unwrap() {
+                adj_dict.entry(v).or_default();
+                adj_dict.get_mut(&u).unwrap().insert(v);
+                adj_dict.get_mut(&v).unwrap().insert(u);
             }
-        });
-    }
-
-    #[divan::bench(args = ARGS, sample_count = SAMPLE_COUNT)]
-    fn bench_delete(bencher: Bencher, n: usize) {
-        let adj = make_adj(n);
-        let mut tree = DNDTree::new(&adj, USE_DSU, COMPRESS_LINKS);
-        let edges = make_edges(n);
-
-        // populate once
-        for &(u, v) in &edges {
-            tree.insert_edge(u, v);
         }
 
-        bencher
-            .with_inputs(|| (edges.clone(), tree.clone()))
-            .bench_local_refs(|(edges, tree)| {
-                for (u, v) in edges {
-                    tree.delete_edge(*u, *v);
-                }
-            });
-    }
+        let mut empty_map: IntMap<i32, IntSet<i32>> = IntMap::default();
+        for &u in adj_list.keys() {
+            empty_map.entry(u).or_default();
+            for &v in adj_list.get(&u).unwrap() {
+                empty_map.entry(v).or_default();
+            }
+        }
 
-    #[divan::bench(args = ARGS, sample_count = SAMPLE_COUNT)]
-    fn mixed_ops(bencher: Bencher, n: usize) {
-        let mut edges = make_edges(n * 2);
+        let mut all_edges: Vec<(usize, usize)> = adj_list
+            .iter()
+            .flat_map(|(&u, neighbors)| neighbors.iter().map(move |&v| (u as usize, v as usize)))
+            .collect();
+
         let mut rng = StdRng::seed_from_u64(12345);
-        edges.shuffle(&mut rng);
+        all_edges.shuffle(&mut rng);
 
-        let (present, absent) = edges.split_at_mut(n);
+        let id_tree = DNDTree::new(&adj_dict, false);
+        let dnd_tree = DNDTree::new(&adj_dict, true);
+        let dnd_tree_comp = DNDTree::new(&adj_dict, true);
 
-        let mut adj = make_adj(n * 2);
-        for &(u, v) in present.iter() {
-            adj.get_mut(&(u as i32)).unwrap().insert(v as i32);
-            adj.get_mut(&(v as i32)).unwrap().insert(u as i32);
+        let n = adj_dict.len();
+        let mut query_edges = Vec::new();
+        for _ in 0..1000 {
+            let u = rng.random_range(0..n);
+            let v = rng.random_range(0..n);
+            if u == v {
+                continue;
+            }
+            query_edges.push((u, v));
         }
 
-        bencher.bench_local(move || {
-            let mut tree = DNDTree::new(&adj, USE_DSU, COMPRESS_LINKS);
+        // Delete some of the edges to create cold trees
+        let deleted_count = all_edges.len() / 5;
+        let del_edges = all_edges.iter().take(deleted_count).collect::<Vec<_>>();
 
-            for i in 0..n {
-                let (du, dv) = present[i];
-                tree.delete_edge(du, dv);
+        let mut query_id_tree = id_tree.clone();
+        let mut query_dnd_tree = dnd_tree.clone();
+        let mut query_dnd_tree_comp = dnd_tree_comp.clone();
+        for &(u, v) in del_edges.iter() {
+            query_id_tree.delete_edge(*u, *v);
+            query_dnd_tree.delete_edge(*u, *v);
+            query_dnd_tree_comp.delete_edge(*u, *v);
+        }
 
-                let (qu, qv) = present[i % present.len()];
-                let _ = tree.query(qu, qv);
-
-                let (iu, iv) = absent[i];
-                tree.insert_edge(iu, iv);
-            }
-        });
+        BenchData {
+            all_edges,
+            empty_map,
+            id_tree,
+            dnd_tree,
+            query_id_tree,
+            query_dnd_tree,
+            query_edges,
+        }
     }
 
-    #[divan::bench(args = ARGS, sample_count = 1)]
-    fn mixed_ops_query_heavy(bencher: Bencher, n: usize) {
-        let mut edges = make_edges_for_nodes(n, n * 2);
-        let mut rng = StdRng::seed_from_u64(12345);
-        edges.shuffle(&mut rng);
+    fn load_graph(filename: &str) -> IntMap<i32, Vec<i32>> {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let mtx_path = PathBuf::from(manifest_dir)
+            .join("benches")
+            .join("data")
+            .join(filename);
+        let reader = BufReader::new(File::open(mtx_path).expect("MTX file missing"));
 
-        let (present_edges, absent_edges) = edges.split_at(n);
+        let mut adj_list: IntMap<i32, Vec<i32>> = IntMap::default();
+        let mut data_started = false;
 
-        let mut adj = make_adj(n);
-        for &(u, v) in present_edges.iter() {
-            adj.get_mut(&(u as i32)).unwrap().insert(v as i32);
-            adj.get_mut(&(v as i32)).unwrap().insert(u as i32);
-        }
+        for line in reader.lines().map_while(Result::ok) {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('%') {
+                continue;
+            }
+            if !data_started {
+                data_started = true;
+                continue;
+            }
 
-        // Pre-select random endpoint pairs (not edges)
-        let num_query_pairs = (QUERY_FACTOR * n as f64) as usize;
-        let mut query_pairs = Vec::with_capacity(num_query_pairs);
-        for _ in 0..num_query_pairs {
-            let qu = rng.random_range(0..n);
-            let qv = rng.random_range(0..n);
-            query_pairs.push((qu, qv));
-        }
-
-        bencher.bench_local(move || {
-            let mut tree = DNDTree::new(&adj, USE_DSU, COMPRESS_LINKS);
-
-            let mut present: Vec<usize> = (0..n).collect();
-            let mut absent: Vec<usize> = (0..n).collect();
-
-            for i in 0..n {
-                let pi = present[i];
-                let (du, dv) = present_edges[pi];
-                tree.delete_edge(du, dv);
-
-                for &(qu, qv) in &query_pairs {
-                    let _ = tree.query(qu, qv);
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let mut u: i32 = parts[0].parse().unwrap();
+                let mut v: i32 = parts[1].parse().unwrap();
+                // Canonicalize
+                if u > v {
+                    std::mem::swap(&mut u, &mut v);
                 }
-
-                let ai = absent[i];
-                let (iu, iv) = absent_edges[ai];
-                tree.insert_edge(iu, iv);
-
-                present[i] = ai;
-                absent[i] = pi;
+                // MTX is 1-based; decrement to 0-based.
+                // Only add once as the graph is undirected and insert_edge handles symmetry.
+                adj_list.entry(u - 1).or_default().push(v - 1);
             }
-        });
-    }
-
-    #[divan::bench(args = ARGS, sample_count = 1)]
-    fn mixed_ops_query_heavy_catgraph(bencher: Bencher, n: usize) {
-        let mut edges = make_edges_for_nodes(n, n * 2);
-        let mut rng = StdRng::seed_from_u64(12345);
-        edges.shuffle(&mut rng);
-
-        let (present_edges, absent_edges) = edges.split_at(n);
-
-        // Replace the adj creation line in mixed_ops_query_heavy
-        let adj = make_caterpillar_graph(n, 0.3, 0.05); // spine ~30% of nodes, 5% extra chords
-
-        // Pre-select random endpoint pairs (not edges)
-        let num_query_pairs = (QUERY_FACTOR * n as f64) as usize;
-        let mut query_pairs = Vec::with_capacity(num_query_pairs);
-        for _ in 0..num_query_pairs {
-            let qu = rng.random_range(0..n);
-            let qv = rng.random_range(0..n);
-            query_pairs.push((qu, qv));
         }
+        adj_list
+    }
+}
 
-        bencher.bench_local(move || {
-            let mut tree = DNDTree::new(&adj, USE_DSU, COMPRESS_LINKS);
+fn trace_insertion(task: Task, data: &BenchData) -> Vec<(i32, usize)> {
+    let mut tree = DNDTree::new(&data.empty_map, task.use_union_find);
+    let mut trace = Vec::with_capacity(data.all_edges.len());
 
-            let mut present: Vec<usize> = (0..n).collect();
-            let mut absent: Vec<usize> = (0..n).collect();
+    for &(u, v) in data.all_edges.iter() {
+        let time = Instant::now();
+        let res = tree.insert_edge(u, v);
+        let elapsed = time.elapsed().as_nanos() as usize;
+        trace.push((res, elapsed));
+    }
+    trace
+}
 
-            for i in 0..n {
-                let pi = present[i];
-                let (du, dv) = present_edges[pi];
-                tree.delete_edge(du, dv);
+fn trace_query_cold(task: Task, data: &BenchData) -> Vec<(i32, usize)> {
+    let mut tree = match task.variant {
+        TaskVariant::DNDTreeNoDSU => data.query_id_tree.clone(),
+        TaskVariant::DNDTree => data.query_dnd_tree.clone(),
+    };
+    let mut trace = Vec::with_capacity(data.query_edges.len());
 
-                for &(qu, qv) in &query_pairs {
-                    let _ = tree.query(qu, qv);
-                }
+    for &(u, v) in data.query_edges.iter() {
+        let time = Instant::now();
+        let res = tree.query(u, v);
+        let elapsed = time.elapsed().as_nanos() as usize;
+        trace.push((res as i32, elapsed));
+    }
+    trace
+}
 
-                let ai = absent[i];
-                let (iu, iv) = absent_edges[ai];
-                tree.insert_edge(iu, iv);
+fn trace_query_warm(task: Task, data: &BenchData) -> Vec<(i32, usize)> {
+    let mut tree = match task.variant {
+        TaskVariant::DNDTreeNoDSU => data.query_id_tree.clone(),
+        TaskVariant::DNDTree => data.query_dnd_tree.clone(),
+    };
+    let mut trace = Vec::with_capacity(data.query_edges.len());
 
-                present[i] = ai;
-                absent[i] = pi;
-            }
-        });
+    for &(u, v) in data.query_edges.iter() {
+        tree.query(u, v);
     }
 
-    #[divan::bench(args = ARGS, sample_count = 1)]
-    fn mixed_ops_query_heavy_tree(bencher: Bencher, n: usize) {
-        let mut edges = make_edges_for_nodes(n, n * 2);
-        let mut rng = StdRng::seed_from_u64(12345);
-        edges.shuffle(&mut rng);
-
-        let (present_edges, absent_edges) = edges.split_at(n);
-
-        // Replace the adj creation line in mixed_ops_query_heavy
-        let adj = make_random_recursive_tree(n, 0.05); // or 0.1 for more chords
-
-        // Pre-select random endpoint pairs (not edges)
-        let num_query_pairs = (QUERY_FACTOR * n as f64) as usize;
-        let mut query_pairs = Vec::with_capacity(num_query_pairs);
-        for _ in 0..num_query_pairs {
-            let qu = rng.random_range(0..n);
-            let qv = rng.random_range(0..n);
-            query_pairs.push((qu, qv));
-        }
-
-        bencher.bench_local(move || {
-            let mut tree = DNDTree::new(&adj, USE_DSU, COMPRESS_LINKS);
-
-            let mut present: Vec<usize> = (0..n).collect();
-            let mut absent: Vec<usize> = (0..n).collect();
-
-            for i in 0..n {
-                let pi = present[i];
-                let (du, dv) = present_edges[pi];
-                tree.delete_edge(du, dv);
-
-                for &(qu, qv) in &query_pairs {
-                    let _ = tree.query(qu, qv);
-                }
-
-                let ai = absent[i];
-                let (iu, iv) = absent_edges[ai];
-                tree.insert_edge(iu, iv);
-
-                present[i] = ai;
-                absent[i] = pi;
-            }
-        });
+    for &(u, v) in data.query_edges.iter() {
+        let time = Instant::now();
+        let res = tree.query(u, v);
+        let elapsed = time.elapsed().as_nanos() as usize;
+        trace.push((res as i32, elapsed));
     }
+    trace
+}
+
+fn trace_delete(task: Task, data: &BenchData) -> Vec<(i32, usize)> {
+    let mut tree = match task.variant {
+        TaskVariant::DNDTreeNoDSU => data.id_tree.clone(),
+        TaskVariant::DNDTree => data.dnd_tree.clone(),
+    };
+    let mut trace = Vec::with_capacity(data.all_edges.len());
+
+    for &(u, v) in data.all_edges.iter() {
+        let time = Instant::now();
+        let res = tree.delete_edge(u, v);
+        let elapsed = time.elapsed().as_nanos() as usize;
+        trace.push((res as i32, elapsed));
+    }
+    trace
+}
+
+fn bench_task(task: Task, data: &BenchData, sample_count: u32) {
+    let mut sample_data = Vec::with_capacity(sample_count as usize);
+    for _ in 0..sample_count {
+        let traces = vec![
+            trace_insertion(task, data),
+            trace_query_cold(task, data),
+            trace_query_warm(task, data),
+            trace_delete(task, data),
+        ];
+        sample_data.push(traces);
+    }
+    report(task, sample_data);
 }
 
 fn main() {
-    divan::main();
+    println!("Preparing road-usroads-48.mtx data...");
+    let start_time = Instant::now();
+    let bench_data = BenchData::new("road-usroads-48.mtx");
+    println!("Prepared in {} ms", start_time.elapsed().as_millis());
+
+    for task in TASKS {
+        bench_task(task, &bench_data, 10);
+    }
+
+    println!("Preparing bdo_exploration_graph.mtx data...");
+    let start_time = Instant::now();
+    let bench_data = BenchData::new("bdo_exploration_graph.mtx");
+    println!("Prepared in {} ms", start_time.elapsed().as_millis());
+
+    for task in TASKS {
+        bench_task(task, &bench_data, 1000);
+    }
 }

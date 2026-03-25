@@ -6,3 +6,6 @@
 
 mod dndtree;
 pub use crate::dndtree::DNDTree;
+
+/// Bridge between C++ and Rust
+pub mod bridge;

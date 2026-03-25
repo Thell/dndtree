@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use dndtree::DNDTree;
 use nohash_hasher::{IntMap, IntSet};
 use rand::SeedableRng;
@@ -39,7 +40,7 @@ fn make_edges_for_nodes(node_count: usize, edge_count: usize) -> Vec<(usize, usi
 }
 
 #[inline(never)]
-fn mixed_ops(n: usize, use_uf: bool, use_compression: bool) {
+fn mixed_ops(n: usize, use_uf: bool) {
     let mut edges = make_edges(n * 2);
     let mut rng = StdRng::seed_from_u64(12345);
     edges.shuffle(&mut rng);
@@ -52,7 +53,7 @@ fn mixed_ops(n: usize, use_uf: bool, use_compression: bool) {
         adj.get_mut(&(v as i32)).unwrap().insert(u as i32);
     }
 
-    let mut tree = DNDTree::new(&adj, use_uf, use_compression);
+    let mut tree = DNDTree::new(&adj, use_uf);
     for i in 0..n {
         let (du, dv) = present[i];
         tree.delete_edge(du, dv);
@@ -65,7 +66,7 @@ fn mixed_ops(n: usize, use_uf: bool, use_compression: bool) {
     }
 }
 
-fn mixed_ops_query_heavy(n: usize, use_uf: bool, use_compression: bool) {
+fn mixed_ops_query_heavy(n: usize, use_uf: bool) {
     let mut edges = make_edges_for_nodes(n, n * 2);
     let mut rng = StdRng::seed_from_u64(12345);
     edges.shuffle(&mut rng);
@@ -78,7 +79,7 @@ fn mixed_ops_query_heavy(n: usize, use_uf: bool, use_compression: bool) {
         adj.get_mut(&(v as i32)).unwrap().insert(u as i32);
     }
 
-    let mut tree = DNDTree::new(&adj, use_uf, use_compression);
+    let mut tree = DNDTree::new(&adj, use_uf);
 
     let mut present: Vec<usize> = (0..n).collect();
     let mut absent: Vec<usize> = (0..n).collect();
@@ -110,11 +111,10 @@ fn main() {
 
     let n: usize = args[1].parse().unwrap();
     let use_uf: bool = args[2].parse().unwrap();
-    let use_compression: bool = args[3].parse().unwrap();
 
     let start_time = std::time::Instant::now();
-    mixed_ops(n, use_uf, use_compression);
-    // mixed_ops_query_heavy(n, use_uf, use_compression);
+    mixed_ops(n, use_uf);
+    // mixed_ops_query_heavy(n, use_uf);
     let elapsed = start_time.elapsed();
     println!("{} took {} microseconds", n, elapsed.as_micros());
     // Wait for user input
