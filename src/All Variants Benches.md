@@ -1,47 +1,75 @@
-# road-usroads-48.mtx
+# Variants
 
-                         |  IDTree    | RcDNDTree-NoDSU | RcDNDTree  | LstDNDTree-NoDSU | LstDNDTree
-Result Type              | Mean (ns)  | Mean (ns)       | Mean (ns)  | Mean (ns)        | Mean (ns)  
-------------------------------------------------------------------------------------------------------
---- INSERTION ---                                                                                    
-Non-Tree Edge            | 2877.66    | 3309.01         | 2816.16    | 2664.06          | 1903.88    
-Tree Edge                | 285.12     | 310.20          | 653.93     | 259.00           | 286.33     
-Non-Tree Reroot          | 485.14     | 502.82          | 1162.22    | 434.69           | 517.22     
-Tree Reroot              | 167.23     | 174.41          | 827.39     | 147.12           | 258.68     
-------------------------------------------------------------------------------------------------------
---- QUERY (COLD) ---                                                                                 
-Disconnected             | 2665.84    | 3449.02         | 545.66     | 3156.21          | 175.85     
-Connected                | 4368.00    | 5408.63         | 588.40     | 4839.09          | 148.80     
-------------------------------------------------------------------------------------------------------
---- QUERY (WARM) ---                                                                                 
-Disconnected             | 1981.35    | 1888.36         | 37.10      | 1742.80          | 31.72      
-Connected                | 3655.66    | 3679.60         | 33.49      | 3344.74          | 30.57      
-------------------------------------------------------------------------------------------------------
---- DELETION ---                                                                                     
-Non-Tree Edge            | 108.56     | 100.84          | 119.54     | 93.40            | 101.51     
-Tree Edge (Split)        | 4695.36    | 4940.88         | 5322.80    | 4199.12          | 4320.88    
-Tree Edge (Replaced)     | 344.37     | 336.82          | 1345.12    | 278.76           | 602.80     
+The full reference C++ implementation has buffered tree operations in-place
+which the paper utilizes for temporal capabilities. The Rust implementations
+do not have this capability. A part of the buffered operations includes dedup
+of tree operations which the Rust implementations also do the remaining
+overhead of the buffered operations is minor but measurable.
 
-# bdo_exploration_graph.mtx
+## C++
+CPPDNDTree => Reference implementation accessed via ffi
 
-                         |  IDTree    | RcDNDTree-NoDSU | RcDNDTree  | LstDNDTree-NoDSU | LstDNDTree
-Result Type              | Mean (ns)  | Mean (ns)       | Mean (ns)  | Mean (ns)        | Mean (ns)  
------------------------------------------------------------------------------------------------------
---- INSERTION ---                                                                              
-Non-Tree Edge            | 194.33     | 217.07          | 239.98     | 178.69           | 157.87     
-Tree Edge                | 68.64      | 77.20           | 116.85     | 66.09            | 72.05      
-Non-Tree Reroot          | 240.90     | 264.10          | 320.74     | 209.08           | 203.94     
-Tree Reroot              | 77.91      | 83.31           | 171.48     | 70.04            | 85.26      
------------------------------------------------------------------------------------------------------
---- QUERY (COLD) ---                                                                                 
-Disconnected             | 48.85      | 51.03           | 44.79      | 41.53            | 30.94      
-Connected                | 55.76      | 60.64           | 53.80      | 46.56            | 32.21      
------------------------------------------------------------------------------------------------------
---- QUERY (WARM) ---                                                                                 
-Disconnected             | 48.42      | 47.37           | 30.91      | 39.51            | 29.25      
-Connected                | 55.93      | 55.62           | 30.22      | 44.17            | 28.72      
------------------------------------------------------------------------------------------------------
---- DELETION ---                                                                                     
-Non-Tree Edge            | 57.69      | 53.57           | 54.86      | 52.10            | 51.57      
-Tree Edge (Split)        | 309.20     | 407.73          | 408.21     | 362.84           | 370.28     
-Tree Edge (Replaced)     | 86.10      | 83.44           | 185.35     | 75.15            | 177.79     
+## Rust
+IDTree => Dedicated ID-Tree only build
+RcDNDTree => DSU implemented as Rc based doubly linked list
+RcDNDTree-NoDSU => Same as previous without DSU enabled
+LstDNDTree- => DSU implemented as array back doubly linked list
+LstDNDTree-NoDSU => Same as previous without DSU enabled
+
+# Benches
+
+The expensive DSU maintenance operations are avoided by the ID-Tree but it pays
+by having to traverse the spanning tree for each tree operation.
+
+
+## road-usroads-48.mtx
+
+This is a medium sized (126k nodes) graph with average degree 2.
+
+                         | CPPDNDTree |  IDTree    | RcDNDTree-NoDSU | RcDNDTree  | LstDNDTree-NoDSU | LstDNDTree
+Result Type              | Mean (ns)  | Mean (ns)  | Mean (ns)       | Mean (ns)  | Mean (ns)        | Mean (ns)  
+-------------------------------------------------------------------------------------------------------------------
+--- INSERTION ---                                                                                                 
+Non-Tree Edge            | 2713.17    | 2518.20    | 3459.13         | 2913.39    | 2486.33          | 1791.31    
+Tree Edge                | 507.72     | 238.48     | 347.35          | 605.74     | 236.99           | 264.51     
+Non-Tree Reroot          | 815.14     | 364.98     | 554.59          | 1236.58    | 359.28           | 431.91     
+Tree Reroot              | 457.72     | 127.40     | 198.64          | 770.62     | 122.54           | 196.55     
+-------------------------------------------------------------------------------------------------------------------
+--- QUERY (COLD) ---                                                                                              
+Disconnected             | 147.94     | 1353.91    | 3427.28         | 444.86     | 1010.35          | 74.35      
+Connected                | 107.66     | 1196.67    | 5538.97         | 426.97     | 883.33           | 36.79      
+-------------------------------------------------------------------------------------------------------------------
+--- QUERY (WARM) ---                                                                                              
+Disconnected             | 40.64      | 561.00     | 2311.87         | 39.25      | 441.66           | 29.32      
+Connected                | 35.26      | 608.33     | 4198.86         | 33.94      | 473.33           | 34.12      
+-------------------------------------------------------------------------------------------------------------------
+--- DELETION ---                                                                                                  
+Non-Tree Edge            | 241.40     | 78.98      | 106.98          | 118.26     | 66.46            | 78.58      
+Tree Edge (Split)        | 5631.15    | 1526.80    | 4398.75         | 4779.68    | 1381.34          | 1486.56    
+Tree Edge (Replaced)     | 998.13     | 146.10     | 420.45          | 1495.75    | 121.83           | 263.88     
+
+## bdo_exploration_graph.mtx
+
+This is a small planar graph (~1k nodes) with average 2.6 degrees.
+
+                         | CPPDNDTree |  IDTree    | RcDNDTree-NoDSU | RcDNDTree  | LstDNDTree-NoDSU | LstDNDTree
+Result Type              | Mean (ns)  | Mean (ns)  | Mean (ns)       | Mean (ns)  | Mean (ns)        | Mean (ns)  
+------------------------------------------------------------------------------------------------------------------
+--- INSERTION ---                                                                                           
+Non-Tree Edge            | 265.09     | 146.96     | 184.23          | 265.09     | 144.38           | 126.64      
+Tree Edge                | 148.56     | 51.84      | 89.67           | 148.56     | 53.04            | 58.15       
+Non-Tree Reroot          | 326.74     | 167.72     | 238.46          | 326.74     | 158.94           | 150.34      
+Tree Reroot              | 161.01     | 53.51      | 131.02          | 161.01     | 53.75            | 66.21       
+-------------------------------------------------------------------------------------------------------------------
+--- QUERY (COLD) ---                                                                                               
+Disconnected             | 35.27      | 41.50      | 42.97           | 35.27      | 39.37            | 30.70       
+Connected                | 36.39      | 47.67      | 52.26           | 36.39      | 43.80            | 32.19       
+-------------------------------------------------------------------------------------------------------------------
+--- QUERY (WARM) ---                                                                                               
+Disconnected             | 31.81      | 41.08      | 29.88           | 31.81      | 37.65            | 29.25       
+Connected                | 31.97      | 47.65      | 29.77           | 31.97      | 41.48            | 29.06       
+-------------------------------------------------------------------------------------------------------------------
+--- DELETION ---                                                                                                   
+Non-Tree Edge            | 96.66      | 39.85      | 39.94           | 96.66      | 38.52            | 38.72       
+Tree Edge (Split)        | 547.90     | 176.71     | 217.77          | 547.90     | 169.48           | 177.79      
+Tree Edge (Replaced)     | 217.50     | 57.51      | 155.97          | 217.50     | 57.39            | 117.96      

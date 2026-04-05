@@ -1,6 +1,5 @@
 use std::vec;
 
-use log::debug;
 use nohash_hasher::{IntMap, IntSet};
 use smallvec::SmallVec;
 
@@ -53,8 +52,8 @@ impl Node {
     fn insert_neighbor(&mut self, u: u32) -> i32 {
         if !self.neighbors.contains(&u) {
             self.neighbors.push(u);
-            // Sorting is for use during the development cycle for divergence testing of op logic
-            self.neighbors.sort();
+            // // Sorting is for use during the development cycle for divergence testing of op logic
+            // self.neighbors.sort();
             return 0;
         }
         1
@@ -63,15 +62,15 @@ impl Node {
     fn delete_neighbor(&mut self, u: u32) -> i32 {
         if let Some(i) = self.neighbors.iter().position(|&x| x == u) {
             self.neighbors.swap_remove(i);
-            // Sorting is for use during the development cycle for divergence testing of op logic
-            self.neighbors.sort();
+            // // Sorting is for use during the development cycle for divergence testing of op logic
+            // self.neighbors.sort();
             return 0;
         }
         1
     }
 }
 
-/// DNDTree
+/// MARK: DNDTree
 //
 // NOTE: After setup completes all node, neighbor and link entries are
 //       guaranteed to be within range 0..self.n
@@ -81,20 +80,18 @@ impl Node {
 #[derive(Clone, Debug)]
 pub struct DNDTree {
     n: usize,
+    use_union_find: bool,
+
     nodes: Vec<Node>,
+    generation: u16,
+    generations: Vec<u16>,
+    vec_scratch_nodes: Vec<usize>,
 
     l_nodes: Vec<Link>,
     children_head: Vec<usize>,
     children_tail: Vec<usize>,
     link_parent: Vec<usize>,
     roots: Vec<usize>,
-
-    vec_scratch_nodes: Vec<usize>,
-    vec_scratch_stack: Vec<usize>,
-    generation: u16,
-    node_generations: Vec<u16>,
-
-    use_union_find: bool,
 }
 
 impl DNDTree {
@@ -181,17 +178,16 @@ impl DNDTree {
 
         Self {
             n,
-            nodes,
-            l_nodes: vec![],
-            children_head: vec![],
-            children_tail: vec![],
-            link_parent: vec![],
-            roots: vec![],
-            vec_scratch_nodes: vec![],
-            vec_scratch_stack: vec![],
-            generation: 1,
-            node_generations: vec![0; n],
             use_union_find,
+            nodes,
+            generation: 1,
+            generations: vec![0; n],
+            vec_scratch_nodes: Vec::with_capacity(n),
+            l_nodes: Vec::with_capacity(n),
+            children_head: Vec::with_capacity(n),
+            children_tail: Vec::with_capacity(n),
+            link_parent: Vec::with_capacity(n),
+            roots: Vec::with_capacity(n),
         }
     }
 
@@ -199,7 +195,7 @@ impl DNDTree {
     fn initialize(&mut self) {
         let use_union_find = self.use_union_find;
 
-        self.generation = self.generation.wrapping_add(1);
+        let cur_generation = self.next_generation();
 
         let sorted_nodes = self.sort_nodes_by_degree();
 
@@ -208,7 +204,8 @@ impl DNDTree {
         }
 
         for &node in sorted_nodes.iter() {
-            if self.node_generations[node] == self.generation {
+            // NOTE: generation is set for the subtree nodes in bfs_setup_subtrees
+            if self.generations[node] == cur_generation {
                 continue;
             }
 
@@ -219,6 +216,8 @@ impl DNDTree {
                 self.reroot(centroid, node);
             }
         }
+
+        self.vec_scratch_nodes.clear();
     }
 
     #[inline(always)]
@@ -242,7 +241,8 @@ impl DNDTree {
         self.vec_scratch_nodes.clear();
         self.vec_scratch_nodes.push(root);
 
-        self.node_generations[root] = self.generation;
+        let cur_generation = self.generation;
+        self.generations[root] = cur_generation;
 
         if use_union_find {
             self.roots[root] = root;
@@ -253,8 +253,8 @@ impl DNDTree {
             for j in 0..self.nodes[p].neighbors.len() {
                 let neighbor = self.nodes[p].neighbors[j] as usize;
 
-                if self.node_generations[neighbor] != self.generation {
-                    self.node_generations[neighbor] = self.generation;
+                if self.generations[neighbor] != cur_generation {
+                    self.generations[neighbor] = cur_generation;
 
                     self.nodes[neighbor].parent = p;
                     self.vec_scratch_nodes.push(neighbor);
@@ -275,6 +275,7 @@ impl DNDTree {
     }
 
     #[inline(always)]
+    // NOTE: Uses pre-populated self.vec_scratch_nodes from bfs_setup_subtrees.
     fn find_centroid_in_q(&self) -> Option<usize> {
         let num_nodes = self.vec_scratch_nodes.len();
         let half_num_nodes = (num_nodes / 2) as i32;
@@ -313,6 +314,16 @@ impl DNDTree {
         debug_assert!(i < self.n);
         unsafe { self.roots.get_unchecked_mut(i) }
     }
+
+    #[inline(always)]
+    fn next_generation(&mut self) -> u16 {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.generation = 1;
+            self.generations.fill(0);
+        }
+        self.generation
+    }
 }
 
 // MARK: Base functions
@@ -325,8 +336,6 @@ impl DNDTree {
 
     #[inline(always)]
     fn delete_edge_balanced(&mut self, mut u: usize, mut v: usize) -> i32 {
-        debug!("delete_edge_balanced({}, {})", u, v);
-
         if (self.nodes[u].parent != v && self.nodes[v].parent != u) || u == v {
             return 0;
         }
@@ -334,7 +343,6 @@ impl DNDTree {
         if self.nodes[v].parent == u {
             std::mem::swap(&mut u, &mut v);
         }
-        debug!("  post memswap: u = {}, v = {}", u, v);
 
         let (p, subtree_u_size) = self.unlink(u, v);
         let (small_node, large_node): (usize, usize) =
@@ -347,11 +355,7 @@ impl DNDTree {
                 (u, p)
             };
 
-        debug!(
-            "  post swap: small_node = {}, large_node = {}",
-            small_node, large_node
-        );
-
+        // NOTE: Populates self.vec_scratch_nodes for potential re-use by remove_subtree_union_find
         if self.find_replacement(small_node, large_node) {
             return 1;
         }
@@ -393,19 +397,12 @@ impl DNDTree {
     ///        target half‑subtree size during rebalancing
     #[inline(always)]
     fn insert_non_tree_edge_balanced(&mut self, u: usize, v: usize, f: usize) -> i32 {
-        debug!("insert_non_tree_edge_balanced({}, {})", u, v);
-
         let (reshape, small_node, large_node, small_p, _large_p) =
             self.detect_depth_imbalance(u, v);
 
         if !reshape {
             return 0;
         }
-
-        debug!(
-            "reshape = {}, small_node = {}, large_node = {}, small_p = {}, _large_p = {}",
-            reshape, small_node, large_node, small_p, _large_p
-        );
 
         // Node at which the subtree should be detached and rerooted.
         let p = self.find_imbalance_centroid(small_node, small_p);
@@ -448,17 +445,11 @@ impl DNDTree {
         mut fu: usize,
         mut fv: usize,
     ) -> i32 {
-        debug!("insert_tree_edge_balanced({}, {}, {}, {})", u, v, fu, fv);
-
         // Ensure fu is the root of the smaller component.
         if self.nodes[fu].subtree_size > self.nodes[fv].subtree_size {
             std::mem::swap(&mut u, &mut v);
             std::mem::swap(&mut fu, &mut fv);
         }
-        debug!(
-            "post memswap: u = {}, v = {}, fu = {}, fv = {}",
-            u, v, fu, fv
-        );
 
         let u = self.rotate_tree(u, v);
 
@@ -511,8 +502,6 @@ impl DNDTree {
         mut u: usize,
         mut v: usize,
     ) -> (bool, usize, usize, usize, usize) {
-        debug!("detect_depth_imbalance({}, {})", u, v);
-
         let mut reshape = false;
         let mut depth = 0;
 
@@ -555,8 +544,6 @@ impl DNDTree {
     /// - the centroid node index
     #[inline(always)]
     fn find_imbalance_centroid(&self, small_node: usize, small_p: usize) -> usize {
-        debug!("find_imbalance_centroid({}, {})", small_node, small_p);
-
         let mut depth_imbalance = 0;
         let mut p = small_p;
 
@@ -566,7 +553,6 @@ impl DNDTree {
         }
 
         depth_imbalance = depth_imbalance / 2 - 1;
-        debug!("  depth imbalance: {}", depth_imbalance);
 
         let mut cur = small_node;
         while depth_imbalance > 0 {
@@ -574,7 +560,6 @@ impl DNDTree {
             depth_imbalance -= 1;
         }
 
-        debug!("  centroid: {}", cur);
         cur
     }
 
@@ -590,13 +575,10 @@ impl DNDTree {
     /// - the last node whose subtree size was adjusted (the root)
     #[inline(always)]
     fn adjust_subtree_sizes(&mut self, start_node: usize, delta: i32) -> usize {
-        debug!("adjust_subtree_sizes({}, {})", start_node, delta);
-
         let mut root_v = start_node;
         let mut w = self.nodes[start_node].parent;
         while w != SENTINEL {
             self.nodes[w].subtree_size += delta;
-            debug!("  {} subtree size: {}", w, self.nodes[w].subtree_size);
             root_v = w;
             w = self.nodes[w].parent;
         }
@@ -618,28 +600,19 @@ impl DNDTree {
     /// - `None` if no rebalance is needed
     #[inline(always)]
     fn rebalance_tree(&mut self, u: usize, v: usize, f: usize) -> Option<usize> {
-        debug!("rebalance_tree({}, {}, {})", u, v, f);
-
         let s = (self.nodes[f].subtree_size + self.nodes[u].subtree_size) / 2;
-        debug!("s = {}", s);
 
         let mut new_root = None;
         let mut p = v;
 
         while p != SENTINEL {
             self.nodes[p].subtree_size += self.nodes[u].subtree_size;
-            debug!(
-                "  p {} subtree_size = {}",
-                p, self.nodes[p as usize].subtree_size
-            );
-
             if new_root.is_none() && self.nodes[p].subtree_size > s {
                 new_root = Some(p);
             }
             p = self.nodes[p].parent;
         }
 
-        debug!("new_root = {:?}", new_root);
         new_root
     }
 
@@ -660,81 +633,70 @@ impl DNDTree {
     ///
     /// Arguments:
     /// - `u`: the root of the detached subtree
-    /// - `f`: the root of the other component
+    /// - `root_v`: the root of the other component
     ///
     /// Returns:
     /// - `true` if a replacement edge was found and the tree structure was rebuilt
     #[inline(always)]
-    fn find_replacement(&mut self, u: usize, f: usize) -> bool {
-        debug!("find_replacement({}, {})", u, f);
-
+    fn find_replacement(&mut self, u: usize, root_v: usize) -> bool {
         self.vec_scratch_nodes.clear();
-
-        self.generation = self.generation.wrapping_add(1);
-        let cur_gen = self.generation;
+        let cur_generation = self.next_generation();
 
         self.vec_scratch_nodes.push(u);
-        self.node_generations[u] = cur_gen;
+        self.generations[u] = cur_generation;
 
+        // NOTE: Do not use a deque here for the queue since popping from the front removes elements
+        //       and when use_union_find is true the scratch vec is used as the subtree to
+        //       to remove from the DSU via the remove subtree processing.
         let mut i = 0;
         while i < self.vec_scratch_nodes.len() {
             let node = self.vec_scratch_nodes[i];
-            let parent = self.nodes[node].parent;
             i += 1;
 
-            for n_idx in 0..self.nodes[node].neighbors.len() {
+            'neighbors: for n_idx in 0..self.nodes[node].neighbors.len() {
                 let neighbor = self.nodes[node].neighbors[n_idx] as usize;
-
-                if neighbor == parent {
+                if neighbor == self.nodes[node].parent {
                     continue;
                 }
 
+                // NOTE: It is tempting to short-circuit this loop with
+                //         `&& self.generations[neighbor] != cur_generation`
+                //       but that can cause improper subtree setup in the scratch collection
+                //       (See the with_dsu::test_mixed_ops_query_heavy test case.)
+                //       For a non-DSU dedicated build for a specific graph this may be worth the
+                //       performance optimization but requires careful analysis.
                 if self.nodes[neighbor].parent == node {
                     self.vec_scratch_nodes.push(neighbor);
-                    if self.node_generations[neighbor] != cur_gen {
-                        self.node_generations[neighbor] = cur_gen;
-                        self.vec_scratch_stack.push(neighbor);
-                    }
+                    self.generations[neighbor] = cur_generation;
                     continue;
                 }
 
-                if self.is_path_clear(neighbor, cur_gen) {
-                    let u = self.rotate_tree(node, neighbor);
-                    let new_root = self.rebalance_tree(u, neighbor, f);
-                    self.fix_rotated_subtree_sizes(u, neighbor);
-
-                    if let Some(new_root) = new_root
-                        && new_root != f
-                    {
-                        self.reroot(new_root, f);
+                let mut w = neighbor;
+                while w != SENTINEL {
+                    if self.generations[w] == cur_generation {
+                        continue 'neighbors;
                     }
-                    return true;
+                    w = self.nodes[w].parent;
                 }
+
+                let rotated_u = self.rotate_tree(node, neighbor);
+                let new_root = self.rebalance_tree(rotated_u, neighbor, root_v);
+                self.fix_rotated_subtree_sizes(rotated_u, neighbor);
+
+                if let Some(new_root) = new_root
+                    && new_root != root_v
+                {
+                    self.reroot(new_root, root_v);
+                }
+                return true;
             }
         }
         false
     }
 
-    #[inline(always)]
-    fn is_path_clear(&mut self, mut w: usize, cur_gen: u16) -> bool {
-        debug!("is_path_clear({}, {})", w, cur_gen);
-
-        while w != SENTINEL {
-            if self.node_generations[w] == cur_gen {
-                return false;
-            }
-            self.node_generations[w] = cur_gen; // ← Eager mark
-            self.vec_scratch_stack.push(w);
-            w = self.nodes[w].parent;
-        }
-        true
-    }
-
     /// Reroots the tree by moving the subtree of `u` to `f`.
     #[inline(always)]
     fn reroot(&mut self, u: usize, f: usize) {
-        debug!("reroot({}, {})", u, f);
-
         let old_root = self.rotate_tree_to_root(u);
         self.fix_rotated_subtree_sizes_until_root(old_root);
 
@@ -774,12 +736,10 @@ impl DNDTree {
     /// - `new_parent`: the parent value to attach the rotated branch under
     #[inline(always)]
     fn _rotate_tree(&mut self, mut u: usize, new_parent: usize) -> usize {
-        debug!("rotate_tree({}, {})", u, new_parent);
-
         let mut p = self.nodes[u].parent;
         self.nodes[u].parent = new_parent;
 
-        while p < self.nodes.len() {
+        while p != SENTINEL {
             let next = self.nodes[p].parent;
             self.nodes[p].parent = u;
             u = p;
@@ -818,35 +778,22 @@ impl DNDTree {
     /// - `stop_parent`: the parent value at which to stop adjusting
     #[inline(always)]
     fn _fix_rotated_subtree_sizes(&mut self, mut u: usize, stop_parent: usize) {
-        debug!("fix_rotated_subtree_sizes({}, {})", u, stop_parent);
-
         let mut p = self.nodes[u].parent;
         while p != stop_parent {
             self.nodes[u].subtree_size -= self.nodes[p].subtree_size;
             self.nodes[p].subtree_size += self.nodes[u].subtree_size;
-            debug!(
-                "node u subtree_size = {}, node p subtree_size = {}",
-                self.nodes[u].subtree_size, self.nodes[p].subtree_size
-            );
             u = p;
             p = self.nodes[p].parent;
         }
     }
 
     fn unlink(&mut self, u: usize, v: usize) -> (usize, i32) {
-        debug!("unlink(u: {}, v: {})", u, v);
-
         let subtree_u_size = self.nodes[u as usize].subtree_size;
-        debug!("  subtree_u_size = {}", subtree_u_size);
 
         let mut root_v = 0;
         let mut w = v;
         while w != SENTINEL {
             self.nodes[w].subtree_size -= subtree_u_size;
-            debug!(
-                "  subtree size of {} = {}",
-                w, self.nodes[w as usize].subtree_size,
-            );
             root_v = w as usize;
             w = self.nodes[w as usize].parent;
         }
@@ -969,6 +916,9 @@ impl DNDTree {
     ///
     /// This function re-parents all nodes in the small subtree to their new roots
     /// and moves the linked lists accordingly.
+    //
+    //  NOTE: Uses pre-populated self.vec_scratch_nodes from find_replacement.
+    //
     #[inline(always)]
     fn remove_subtree_union_find(&mut self, small_root: usize, large_root: usize) {
         let fv = large_root;

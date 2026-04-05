@@ -177,8 +177,8 @@ inline void Node::flush()
     ins_buf.clear();
     del_buf.clear();
 
-    // sort l
-    sort(l.begin(), l.end());
+    // // sort l
+    // sort(l.begin(), l.end());
     adj = l;
 }
 
@@ -646,7 +646,7 @@ inline bool DNDTree::find_replacement(int u, int f)
     for (int i = 0; i < (int)q.size(); ++i)
     {
         int x = q[i], p, pp;
-        nodes[x].flush();
+        nodes[x].flush(); // ensure all buffured operations are done
         if (G_TRACE_ENABLED) {
             std::cout << "[CPP]   scanning neighbors of (" << x << ")" << std::endl;
             std::cout << "[CPP]     adj for node " << u << ": ";
@@ -686,8 +686,12 @@ inline bool DNDTree::find_replacement(int u, int f)
             if (!succ)
                 continue;
 
-            for (p = nodes[x].p, nodes[x].p = y; p != -1;)
-                pp = nodes[p].p, nodes[p].p = x, x = p, p = pp;
+            for (p = nodes[x].p, nodes[x].p = y; p != -1;) {
+                pp = nodes[p].p;
+                nodes[p].p = x;
+                x = p;
+                p = pp;
+            }
 
             int s = (nodes[f].sub_cnt + nodes[u].sub_cnt) / 2, r = -1;
             for (p = y; p != -1; p = nodes[p].p)
@@ -697,8 +701,11 @@ inline bool DNDTree::find_replacement(int u, int f)
                     r = p;
             }
 
-            for (p = nodes[x].p; p != y; x = p, p = nodes[p].p)
-                nodes[x].sub_cnt -= nodes[p].sub_cnt, nodes[p].sub_cnt += nodes[x].sub_cnt;
+            for (p = nodes[x].p; p != y; x = p, p = nodes[p].p) {
+                nodes[x].sub_cnt -= nodes[p].sub_cnt;
+                nodes[p].sub_cnt += nodes[x].sub_cnt;
+            }
+
             for (int k = 0; k < (int)l.size(); ++k)
                 used[l[k]] = false;
 
