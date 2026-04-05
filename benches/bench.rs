@@ -1,4 +1,7 @@
 /*
+   NOTE: This bench setup is from earlier commits where all variants were used and is left this
+         way for reference and continuity.
+
    The API being benched is:
 
    /// Creating a new Tree
@@ -66,7 +69,6 @@ use statrs::statistics::Statistics;
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum TaskVariant {
     CPPDNDTree,
-    DNDTreeNoDSU,
     DNDTree,
 }
 
@@ -75,7 +77,6 @@ impl TaskVariant {
         match self {
             TaskVariant::CPPDNDTree => "CPPDNDTree",
             TaskVariant::DNDTree => "DNDTree",
-            TaskVariant::DNDTreeNoDSU => "DNDTreeNoDSU",
         }
     }
 }
@@ -83,7 +84,6 @@ impl TaskVariant {
 #[derive(Clone, Copy)]
 struct Task {
     variant: TaskVariant,
-    use_union_find: bool,
 }
 
 impl fmt::Display for Task {
@@ -92,18 +92,12 @@ impl fmt::Display for Task {
     }
 }
 
-const TASKS: [Task; 3] = [
+const TASKS: [Task; 2] = [
     Task {
         variant: TaskVariant::CPPDNDTree,
-        use_union_find: false,
     },
     Task {
         variant: TaskVariant::DNDTree,
-        use_union_find: true,
-    },
-    Task {
-        variant: TaskVariant::DNDTreeNoDSU,
-        use_union_find: false,
     },
 ];
 
@@ -218,10 +212,8 @@ struct BenchData {
     n: usize,
     all_edges: Vec<(usize, usize)>,
     del_edges: Vec<(usize, usize)>,
-    empty_map: IntMap<i32, IntSet<i32>>,
-    dnd_tree_no_dsu: DNDTree,
+    empty_map: IntMap<usize, IntSet<usize>>,
     dnd_tree: DNDTree,
-    query_dnd_tree_no_dsu: DNDTree,
     query_dnd_tree: DNDTree,
     query_edges: Vec<(usize, usize)>,
 }
@@ -229,7 +221,7 @@ struct BenchData {
 impl BenchData {
     fn new(filename: &str) -> Self {
         let adj_list = BenchData::load_graph(filename);
-        let mut adj_dict: IntMap<i32, IntSet<i32>> = IntMap::default();
+        let mut adj_dict: IntMap<usize, IntSet<usize>> = IntMap::default();
         for &u in adj_list.keys() {
             adj_dict.entry(u).or_default();
             for &v in adj_list.get(&u).unwrap() {
@@ -239,7 +231,7 @@ impl BenchData {
             }
         }
 
-        let mut empty_map: IntMap<i32, IntSet<i32>> = IntMap::default();
+        let mut empty_map: IntMap<usize, IntSet<usize>> = IntMap::default();
         for &u in adj_list.keys() {
             empty_map.entry(u).or_default();
             for &v in adj_list.get(&u).unwrap() {
@@ -255,8 +247,7 @@ impl BenchData {
         let mut rng = StdRng::seed_from_u64(12345);
         all_edges.shuffle(&mut rng);
 
-        let dnd_tree_no_dsu = DNDTree::new(&adj_dict, false);
-        let dnd_tree = DNDTree::new(&adj_dict, true);
+        let dnd_tree = DNDTree::new(&adj_dict);
 
         let n = adj_dict.len();
         let mut query_edges = Vec::new();
@@ -277,11 +268,9 @@ impl BenchData {
             .cloned()
             .collect::<Vec<_>>();
 
-        let mut query_dnd_tree_no_dsu = dnd_tree_no_dsu.clone();
         let mut query_dnd_tree = dnd_tree.clone();
 
         for &(u, v) in del_edges.iter() {
-            query_dnd_tree_no_dsu.delete_edge(u, v);
             query_dnd_tree.delete_edge(u, v);
         }
 
@@ -290,15 +279,13 @@ impl BenchData {
             all_edges,
             del_edges,
             empty_map,
-            dnd_tree_no_dsu,
             dnd_tree,
-            query_dnd_tree_no_dsu,
             query_dnd_tree,
             query_edges,
         }
     }
 
-    fn load_graph(filename: &str) -> IntMap<i32, Vec<i32>> {
+    fn load_graph(filename: &str) -> IntMap<usize, Vec<usize>> {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let mtx_path = PathBuf::from(manifest_dir)
             .join("benches")
@@ -306,7 +293,7 @@ impl BenchData {
             .join(filename);
         let reader = BufReader::new(File::open(mtx_path).expect("MTX file missing"));
 
-        let mut adj_list: IntMap<i32, Vec<i32>> = IntMap::default();
+        let mut adj_list: IntMap<usize, Vec<usize>> = IntMap::default();
         let mut data_started = false;
 
         for line in reader.lines().map_while(Result::ok) {
@@ -321,8 +308,8 @@ impl BenchData {
 
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
             if parts.len() >= 2 {
-                let mut u: i32 = parts[0].parse().unwrap();
-                let mut v: i32 = parts[1].parse().unwrap();
+                let mut u: usize = parts[0].parse().unwrap();
+                let mut v: usize = parts[1].parse().unwrap();
                 // Canonicalize
                 if u > v {
                     std::mem::swap(&mut u, &mut v);
@@ -378,7 +365,7 @@ fn trace_insertion(task: Task, data: &BenchData) -> Vec<(i32, usize)> {
         return trace;
     }
 
-    let mut tree = DNDTree::new(&data.empty_map, task.use_union_find);
+    let mut tree = DNDTree::new(&data.empty_map);
     let mut trace = Vec::with_capacity(data.all_edges.len());
 
     for &(u, v) in data.all_edges.iter() {
@@ -411,7 +398,6 @@ fn trace_query_cold(task: Task, data: &BenchData) -> Vec<(i32, usize)> {
     }
 
     let mut tree = match task.variant {
-        TaskVariant::DNDTreeNoDSU => data.query_dnd_tree_no_dsu.clone(),
         TaskVariant::DNDTree => data.query_dnd_tree.clone(),
         _ => unreachable!(),
     };
@@ -451,7 +437,6 @@ fn trace_query_warm(task: Task, data: &BenchData) -> Vec<(i32, usize)> {
     }
 
     let mut tree = match task.variant {
-        TaskVariant::DNDTreeNoDSU => data.query_dnd_tree_no_dsu.clone(),
         TaskVariant::DNDTree => data.query_dnd_tree.clone(),
         _ => unreachable!(),
     };
@@ -486,7 +471,6 @@ fn trace_delete(task: Task, data: &BenchData) -> Vec<(i32, usize)> {
     }
 
     let mut tree = match task.variant {
-        TaskVariant::DNDTreeNoDSU => data.dnd_tree_no_dsu.clone(),
         TaskVariant::DNDTree => data.dnd_tree.clone(),
         _ => unreachable!(),
     };

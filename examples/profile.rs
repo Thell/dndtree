@@ -1,3 +1,5 @@
+// This is primarily an ad-hoc profiling build.
+//
 #![allow(dead_code)]
 use dndtree::DNDTree;
 use nohash_hasher::{IntMap, IntSet};
@@ -7,10 +9,10 @@ use rand::rngs::StdRng;
 
 const QUERY_FACTOR: usize = 10;
 
-fn make_adj(n: usize) -> IntMap<i32, IntSet<i32>> {
-    let mut adj: IntMap<i32, IntSet<i32>> = IntMap::default();
+fn make_adj(n: usize) -> IntMap<usize, IntSet<usize>> {
+    let mut adj: IntMap<usize, IntSet<usize>> = IntMap::default();
     for i in 0..n {
-        adj.insert(i as i32, IntSet::default());
+        adj.insert(i, IntSet::default());
     }
     adj
 }
@@ -40,7 +42,7 @@ fn make_edges_for_nodes(node_count: usize, edge_count: usize) -> Vec<(usize, usi
 }
 
 #[inline(never)]
-fn mixed_ops(n: usize, use_uf: bool) {
+fn mixed_ops(n: usize) {
     let mut edges = make_edges(n * 2);
     let mut rng = StdRng::seed_from_u64(12345);
     edges.shuffle(&mut rng);
@@ -49,11 +51,11 @@ fn mixed_ops(n: usize, use_uf: bool) {
 
     let mut adj = make_adj(n * 2);
     for &(u, v) in present.iter() {
-        adj.get_mut(&(u as i32)).unwrap().insert(v as i32);
-        adj.get_mut(&(v as i32)).unwrap().insert(u as i32);
+        adj.get_mut(&u).unwrap().insert(v);
+        adj.get_mut(&v).unwrap().insert(u);
     }
 
-    let mut tree = DNDTree::new(&adj, use_uf);
+    let mut tree = DNDTree::new(&adj);
     for i in 0..n {
         let (du, dv) = present[i];
         tree.delete_edge(du, dv);
@@ -66,7 +68,7 @@ fn mixed_ops(n: usize, use_uf: bool) {
     }
 }
 
-fn mixed_ops_query_heavy(n: usize, use_uf: bool) {
+fn mixed_ops_query_heavy(n: usize) {
     let mut edges = make_edges_for_nodes(n, n * 2);
     let mut rng = StdRng::seed_from_u64(12345);
     edges.shuffle(&mut rng);
@@ -75,11 +77,11 @@ fn mixed_ops_query_heavy(n: usize, use_uf: bool) {
 
     let mut adj = make_adj(n);
     for &(u, v) in present_edges.iter() {
-        adj.get_mut(&(u as i32)).unwrap().insert(v as i32);
-        adj.get_mut(&(v as i32)).unwrap().insert(u as i32);
+        adj.get_mut(&u).unwrap().insert(v);
+        adj.get_mut(&v).unwrap().insert(u);
     }
 
-    let mut tree = DNDTree::new(&adj, use_uf);
+    let mut tree = DNDTree::new(&adj);
 
     let mut present: Vec<usize> = (0..n).collect();
     let mut absent: Vec<usize> = (0..n).collect();
@@ -110,10 +112,9 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     let n: usize = args[1].parse().unwrap();
-    let use_uf: bool = args[2].parse().unwrap();
 
     let start_time = std::time::Instant::now();
-    mixed_ops(n, use_uf);
+    mixed_ops(n);
     // mixed_ops_query_heavy(n, use_uf);
     let elapsed = start_time.elapsed();
     println!("{} took {} microseconds", n, elapsed.as_micros());

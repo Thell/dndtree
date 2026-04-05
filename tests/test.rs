@@ -1,3 +1,6 @@
+//   NOTE: This test setup is from earlier commits where all variants were used and is left this
+//         way for reference and continuity
+//
 use std::fs::File;
 use std::io::BufRead;
 use std::io::BufReader;
@@ -5,22 +8,18 @@ use std::path::PathBuf;
 
 use dndtree::DNDTree;
 use dndtree::bridge::ffi;
-use idtree::IdTree;
+use idtree::IDTree;
 use nohash_hasher::{IntMap, IntSet};
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
-fn setup_cpp_tree(
-    n: usize,
-    edges: &[(i32, i32)],
-    use_dsu: bool,
-) -> cxx::UniquePtr<ffi::CPPDNDTree> {
+fn setup_cpp_tree(n: usize, edges: &[(usize, usize)]) -> cxx::UniquePtr<ffi::CPPDNDTree> {
     let mut adj = vec![vec![]; n];
     for &(u, v) in edges {
-        if u >= 0 && u < n as i32 && v >= 0 && v < n as i32 {
-            adj[u as usize].push(v);
-            adj[v as usize].push(u);
+        if u < n && v < n {
+            adj[u].push(v as i32);
+            adj[v].push(u as i32);
         }
     }
 
@@ -33,19 +32,7 @@ fn setup_cpp_tree(
         }
     }
 
-    ffi::new_cpp_dndtree_from_flat_adj(n as i32, &degrees, &flat_neighbors, use_dsu)
-}
-
-fn make_adj_i32(n: usize, edges: &[(usize, usize)]) -> IntMap<i32, IntSet<i32>> {
-    let mut adj: IntMap<i32, IntSet<i32>> = IntMap::default();
-    for i in 0..n {
-        adj.insert(i as i32, IntSet::default());
-    }
-    for &(u, v) in edges {
-        adj.get_mut(&(u as i32)).unwrap().insert(v as i32);
-        adj.get_mut(&(v as i32)).unwrap().insert(u as i32);
-    }
-    adj
+    ffi::new_cpp_dndtree_from_flat_adj(n as i32, &degrees, &flat_neighbors, true)
 }
 
 fn make_adj_usize(n: usize, edges: &[(usize, usize)]) -> IntMap<usize, IntSet<usize>> {
@@ -60,7 +47,7 @@ fn make_adj_usize(n: usize, edges: &[(usize, usize)]) -> IntMap<usize, IntSet<us
     adj
 }
 
-fn connected_idtree(tree: &mut IdTree, u: usize, v: usize) -> bool {
+fn connected_idtree(tree: &mut IDTree, u: usize, v: usize) -> bool {
     tree.query(u, v)
 }
 
@@ -68,10 +55,10 @@ fn connected_dnd(tree: &mut DNDTree, u: usize, v: usize) -> bool {
     tree.query(u, v)
 }
 
-fn make_adj(n: usize) -> IntMap<i32, IntSet<i32>> {
-    let mut adj: IntMap<i32, IntSet<i32>> = IntMap::default();
+fn make_adj(n: usize) -> IntMap<usize, IntSet<usize>> {
+    let mut adj: IntMap<usize, IntSet<usize>> = IntMap::default();
     for i in 0..n {
-        adj.insert(i as i32, IntSet::default());
+        adj.insert(i, IntSet::default());
     }
     adj
 }
@@ -110,9 +97,9 @@ fn make_caterpillar_graph(
     n: usize,
     spine_length_ratio: f64, // 0.1 = short spine, 0.5 = half nodes on spine
     extra_edges_ratio: f64,  // how many additional random chords
-) -> IntMap<i32, IntSet<i32>> {
-    let mut adj: IntMap<i32, IntSet<i32>> = IntMap::default();
-    for i in 0..n as i32 {
+) -> IntMap<usize, IntSet<usize>> {
+    let mut adj: IntMap<usize, IntSet<usize>> = IntMap::default();
+    for i in 0..n {
         adj.insert(i, IntSet::default());
     }
 
@@ -122,17 +109,17 @@ fn make_caterpillar_graph(
     let spine_len = (n as f64 * spine_length_ratio).max(10.0).min(n as f64) as usize;
     let mut spine = Vec::with_capacity(spine_len);
     for i in 0..spine_len {
-        spine.push(i as i32);
+        spine.push(i);
         if i > 0 {
             let prev = spine[i - 1];
-            adj.get_mut(&prev).unwrap().insert(i as i32);
-            adj.get_mut(&(i as i32)).unwrap().insert(prev);
+            adj.get_mut(&prev).unwrap().insert(i);
+            adj.get_mut(&i).unwrap().insert(prev);
         }
     }
 
     // 2. Attach remaining nodes as leaves or small trees to the spine
-    let mut next_node = spine_len as i32;
-    while next_node < n as i32 {
+    let mut next_node = spine_len;
+    while next_node < n {
         // Pick random spine node to attach to
         let attach_to = spine[rng.random_range(0..spine.len())];
 
@@ -140,7 +127,7 @@ fn make_caterpillar_graph(
         let chain_len = rng.random_range(1..=4);
         let mut prev = attach_to;
         for _ in 0..chain_len {
-            if next_node >= n as i32 {
+            if next_node >= n {
                 break;
             }
             adj.get_mut(&prev).unwrap().insert(next_node);
@@ -153,8 +140,8 @@ fn make_caterpillar_graph(
     // 3. Add a few random chords (keep connectivity high but allow splits)
     let extra_count = (n as f64 * extra_edges_ratio) as usize;
     for _ in 0..extra_count {
-        let u = rng.random_range(0..n as i32);
-        let v = rng.random_range(0..n as i32);
+        let u = rng.random_range(0..n);
+        let v = rng.random_range(0..n);
         if u != v && !adj.get(&u).unwrap().contains(&v) {
             adj.get_mut(&u).unwrap().insert(v);
             adj.get_mut(&v).unwrap().insert(u);
@@ -256,13 +243,12 @@ mod with_dsu {
     use log::debug;
 
     use super::*;
-    pub const USE_DSU: bool = true;
 
     #[test]
     fn test_basic_insert_delete_query() {
         let edges = vec![(0, 1), (1, 2), (2, 3)];
-        let adj = make_adj_i32(4, &edges);
-        let mut t = DNDTree::new(&adj, USE_DSU);
+        let adj = make_adj_usize(4, &edges);
+        let mut t = DNDTree::new(&adj);
 
         assert!(t.query(0, 3), "query 1");
         t.delete_edge(1, 2);
@@ -274,8 +260,8 @@ mod with_dsu {
     #[test]
     fn test_unlink_splits_correctly() {
         let edges = vec![(0, 1), (1, 2), (2, 3)];
-        let adj = make_adj_i32(4, &edges);
-        let mut t = DNDTree::new(&adj, USE_DSU);
+        let adj = make_adj_usize(4, &edges);
+        let mut t = DNDTree::new(&adj);
 
         t.delete_edge(1, 2);
         assert!(t.query(0, 1));
@@ -286,8 +272,8 @@ mod with_dsu {
     #[test]
     fn test_replacement_edge_found() {
         let edges = vec![(0, 1), (1, 2), (2, 3), (0, 3)];
-        let adj = make_adj_i32(4, &edges);
-        let mut t = DNDTree::new(&adj, USE_DSU);
+        let adj = make_adj_usize(4, &edges);
+        let mut t = DNDTree::new(&adj);
 
         let r = t.delete_edge(1, 2);
         assert_eq!(r, 1);
@@ -298,8 +284,8 @@ mod with_dsu {
     #[test]
     fn test_replacement_edge_not_found() {
         let edges = vec![(0, 1), (1, 2), (2, 3)];
-        let adj = make_adj_i32(4, &edges);
-        let mut t = DNDTree::new(&adj, USE_DSU);
+        let adj = make_adj_usize(4, &edges);
+        let mut t = DNDTree::new(&adj);
 
         let r = t.delete_edge(1, 2);
         assert_eq!(r, 2);
@@ -320,11 +306,11 @@ mod with_dsu {
             }
         }
 
-        let adj_dnd = make_adj_i32(n, &edges);
+        let adj_dnd = make_adj_usize(n, &edges);
         let adj_id = make_adj_usize(n, &edges);
 
-        let mut dnd = DNDTree::new(&adj_dnd, USE_DSU);
-        let mut idt = IdTree::new(&adj_id);
+        let mut dnd = DNDTree::new(&adj_dnd);
+        let mut idt = IDTree::new(&adj_id);
 
         for _ in 0..200 {
             let u = rng.random_range(0..n);
@@ -364,11 +350,11 @@ mod with_dsu {
 
         let mut adj = make_adj(n);
         for &(u, v) in present_edges.iter() {
-            adj.get_mut(&(u as i32)).unwrap().insert(v as i32);
-            adj.get_mut(&(v as i32)).unwrap().insert(u as i32);
+            adj.get_mut(&(u)).unwrap().insert(v);
+            adj.get_mut(&(v)).unwrap().insert(u);
         }
 
-        let mut tree = DNDTree::new(&adj, USE_DSU);
+        let mut tree = DNDTree::new(&adj);
 
         let mut present: Vec<usize> = (0..n).collect();
         let mut absent: Vec<usize> = (0..n).collect();
@@ -417,7 +403,7 @@ mod with_dsu {
             query_pairs.push((qu, qv));
         }
 
-        let mut tree = DNDTree::new(&adj, USE_DSU);
+        let mut tree = DNDTree::new(&adj);
 
         let mut present: Vec<usize> = (0..n).collect();
         let mut absent: Vec<usize> = (0..n).collect();
@@ -451,8 +437,8 @@ mod with_dsu {
         let mtx_data = MtxData::new("bdo_exploration_graph.mtx");
         let all_nodes = mtx_data.empty_map_i32.keys().collect::<Vec<_>>();
 
-        let mut dnd = DNDTree::new(&mtx_data.empty_map_i32, USE_DSU);
-        let mut idt = IdTree::new(&mtx_data.empty_map_usize);
+        let mut dnd = DNDTree::new(&mtx_data.empty_map_usize);
+        let mut idt = IDTree::new(&mtx_data.empty_map_usize);
 
         for &(u, v) in mtx_data.all_edges.iter() {
             debug!(
@@ -566,306 +552,6 @@ mod with_dsu {
     }
 }
 
-mod without_dsu {
-    use log::debug;
-
-    use super::*;
-    pub const USE_DSU: bool = false;
-
-    #[test]
-    fn test_basic_insert_delete_query() {
-        let edges = vec![(0, 1), (1, 2), (2, 3)];
-        let adj = make_adj_i32(4, &edges);
-        let mut t = DNDTree::new(&adj, USE_DSU);
-
-        assert!(t.query(0, 3), "query 1");
-        t.delete_edge(1, 2);
-        assert!(!t.query(0, 3), "query 2");
-        t.insert_edge(1, 2);
-        assert!(t.query(0, 3), "query 3");
-    }
-
-    #[test]
-    fn test_unlink_splits_correctly() {
-        let edges = vec![(0, 1), (1, 2), (2, 3)];
-        let adj = make_adj_i32(4, &edges);
-        let mut t = DNDTree::new(&adj, USE_DSU);
-
-        t.delete_edge(1, 2);
-        assert!(t.query(0, 1));
-        assert!(!t.query(0, 3));
-        assert!(t.query(2, 3));
-    }
-
-    #[test]
-    fn test_replacement_edge_found() {
-        let edges = vec![(0, 1), (1, 2), (2, 3), (0, 3)];
-        let adj = make_adj_i32(4, &edges);
-        let mut t = DNDTree::new(&adj, USE_DSU);
-
-        let r = t.delete_edge(1, 2);
-        assert_eq!(r, 1);
-        assert!(t.query(1, 2));
-        assert!(t.query(0, 3));
-    }
-
-    #[test]
-    fn test_replacement_edge_not_found() {
-        let edges = vec![(0, 1), (1, 2), (2, 3)];
-        let adj = make_adj_i32(4, &edges);
-        let mut t = DNDTree::new(&adj, USE_DSU);
-
-        let r = t.delete_edge(1, 2);
-        assert_eq!(r, 2);
-        assert!(!t.query(0, 3));
-    }
-
-    #[test]
-    fn test_dndtree_matches_idtree() {
-        let mut rng = StdRng::seed_from_u64(99999);
-        let n = 50;
-        let mut edges = vec![];
-
-        for _ in 0..100 {
-            let u = rng.random_range(0..n);
-            let v = rng.random_range(0..n);
-            if u != v {
-                edges.push((u, v));
-            }
-        }
-
-        let adj_dnd = make_adj_i32(n, &edges);
-        let adj_id = make_adj_usize(n, &edges);
-
-        let mut dnd = DNDTree::new(&adj_dnd, USE_DSU);
-        let mut idt = IdTree::new(&adj_id);
-
-        for _ in 0..200 {
-            let u = rng.random_range(0..n);
-            let v = rng.random_range(0..n);
-
-            let op = rng.random_range(0..3);
-            match op {
-                0 => {
-                    let dnd_res = dnd.insert_edge(u, v);
-                    let idt_res = idt.insert_edge(u, v);
-                    assert!(
-                        dnd_res == idt_res,
-                        "Insert results don't match u = {u}, v = {v}, dnd_res = {dnd_res}, idt_res = {idt_res}"
-                    );
-                }
-                1 => {
-                    let dnd_res = dnd.delete_edge(u, v);
-                    let idt_res = idt.delete_edge(u, v);
-                    assert!(
-                        dnd_res == idt_res,
-                        "Delete results don't match u = {u}, v = {v}, dnd_res = {dnd_res}, idt_res = {idt_res}"
-                    );
-                }
-                _ => {}
-            }
-
-            for _ in 0..20 {
-                let a = rng.random_range(0..n);
-                let b = rng.random_range(0..n);
-                assert_eq!(
-                    connected_dnd(&mut dnd, a, b),
-                    connected_idtree(&mut idt, a, b)
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_mixed_ops_query_heavy() {
-        let n = 1_000;
-        let query_factor = 10;
-
-        let edges = make_edges_for_nodes(n, n * 2);
-        let (present_edges, absent_edges) = edges.split_at(n);
-
-        let mut adj = make_adj(n);
-        for &(u, v) in present_edges.iter() {
-            adj.get_mut(&(u as i32)).unwrap().insert(v as i32);
-            adj.get_mut(&(v as i32)).unwrap().insert(u as i32);
-        }
-
-        let mut tree = DNDTree::new(&adj, USE_DSU);
-
-        let mut present: Vec<usize> = (0..n).collect();
-        let mut absent: Vec<usize> = (0..n).collect();
-
-        for i in 0..n {
-            let pi = present[i];
-            let (du, dv) = present_edges[pi];
-            tree.delete_edge(du, dv);
-
-            for q in 0..query_factor {
-                let qi = present[(i + q) % n];
-                let (qu, qv) = present_edges[qi];
-                let _ = tree.query(qu, qv);
-            }
-
-            let ai = absent[i];
-            let (iu, iv) = absent_edges[ai];
-            tree.insert_edge(iu, iv);
-
-            present[i] = ai;
-            absent[i] = pi;
-        }
-    }
-
-    #[test]
-    fn mixed_ops_query_heavy_catgraph() {
-        const QUERY_FACTOR: f64 = 0.05;
-
-        use rand::SeedableRng;
-        use rand::rngs::StdRng;
-
-        let n = 20_000;
-        let edges = make_edges_for_nodes(n, n * 2);
-        let mut rng = StdRng::seed_from_u64(12345);
-
-        let (present_edges, absent_edges) = edges.split_at(n);
-
-        let adj = make_caterpillar_graph(n, 0.3, 0.05); // spine ~30% of nodes, 5% extra chords
-
-        // Pre-select random endpoint pairs (not edges)
-        let num_query_pairs = (QUERY_FACTOR * n as f64) as usize;
-        let mut query_pairs = Vec::with_capacity(num_query_pairs);
-        for _ in 0..num_query_pairs {
-            let qu = rng.random_range(0..n);
-            let qv = rng.random_range(0..n);
-            query_pairs.push((qu, qv));
-        }
-
-        let mut tree = DNDTree::new(&adj, USE_DSU);
-
-        let mut present: Vec<usize> = (0..n).collect();
-        let mut absent: Vec<usize> = (0..n).collect();
-
-        for i in 0..n {
-            let pi = present[i];
-            let (du, dv) = present_edges[pi];
-            tree.delete_edge(du, dv);
-
-            for &(qu, qv) in &query_pairs {
-                let _ = tree.query(qu, qv);
-            }
-
-            let ai = absent[i];
-            let (iu, iv) = absent_edges[ai];
-            tree.insert_edge(iu, iv);
-
-            present[i] = ai;
-            absent[i] = pi;
-        }
-    }
-
-    // This test will fail if sorting of neighbors is not applied
-    #[test]
-    #[ignore]
-    fn test_dndtree_matches_idtree_mtx() {
-        // let _ = simple_logger::SimpleLogger::new()
-        //     .with_level(log::LevelFilter::Debug)
-        //     .init();
-
-        let mtx_data = MtxData::new("bdo_exploration_graph.mtx");
-        let all_nodes = mtx_data.empty_map_i32.keys().collect::<Vec<_>>();
-
-        let mut dnd = DNDTree::new(&mtx_data.empty_map_i32, USE_DSU);
-        let mut idt = IdTree::new(&mtx_data.empty_map_usize);
-
-        for &(u, v) in mtx_data.all_edges.iter() {
-            debug!(
-                "----------------------------------------------\n inserting edge u = {u}, v = {v}\n----------------------------------------------"
-            );
-            debug!("-----DNDTree no dsu no compression");
-            let dnd_res = dnd.insert_edge(u, v);
-            debug!("\n-----IDTree");
-            let idt_res = idt.insert_edge(u, v);
-
-            // Validate all nodes state
-            let mut divergent_state = false;
-            for &u in all_nodes.iter() {
-                let dnd_node_data = dnd.get_node_data(*u as usize);
-                let idt_node_data = idt.get_node_data(*u as usize);
-                if dnd_node_data.parent != idt_node_data.parent as usize
-                    || dnd_node_data.subtree_size != idt_node_data.subtree_size
-                    || dnd_node_data.neighbors.len() != idt_node_data.neighbors.len()
-                {
-                    divergent_state = true;
-                    debug!(
-                        "post insert state of u: {}\n  dnd_node_data: {:?}\n  idt_node_data: {:?}",
-                        u, dnd_node_data, idt_node_data
-                    );
-                }
-            }
-            if divergent_state {
-                debug!("DNDTree and IDTree diverged!");
-            }
-            assert!(
-                dnd_res == idt_res,
-                "Insert results don't match u = {u}, v = {v}, dnd_res = {dnd_res}, idt_res = {idt_res}"
-            );
-
-            let dnd_res = dnd.query(u, v);
-            let idt_res = idt.query(u, v);
-            assert!(
-                dnd_res == idt_res,
-                "Query results don't match after insert u = {u}, v = {v}, dnd_res = {dnd_res}, idt_res = {idt_res}"
-            );
-        }
-        for &(u, v) in mtx_data.all_edges.iter() {
-            debug!(
-                "----------------------------------------------\n deleting edge u = {u}, v = {v}\n----------------------------------------------"
-            );
-            debug!("-----DNDTree");
-            let dnd_res = dnd.delete_edge(u, v);
-            debug!("\n-----IDTree");
-            let idt_res = idt.delete_edge(u, v);
-
-            // Validate all nodes state
-            let mut divergent_state = false;
-            for &u in all_nodes.iter() {
-                let dnd_node_data = dnd.get_node_data(*u as usize);
-                let idt_node_data = idt.get_node_data(*u as usize);
-                if dnd_node_data.parent != idt_node_data.parent as usize
-                    || dnd_node_data.subtree_size != idt_node_data.subtree_size
-                    || dnd_node_data.neighbors.len() != idt_node_data.neighbors.len()
-                {
-                    divergent_state = true;
-                    debug!(
-                        "post insert state of u: {}\n  dnd_node_data: {:?}\n  idt_node_data: {:?}",
-                        u, dnd_node_data, idt_node_data
-                    );
-                }
-            }
-            if divergent_state {
-                panic!("DNDTree and IDTree diverged!");
-            }
-            assert!(
-                dnd_res == idt_res,
-                "Delete results don't match u = {u}, v = {v}, dnd_res = {dnd_res}, idt_res = {idt_res}"
-            );
-
-            let dnd_res = dnd.query(u, v);
-            let idt_res = idt.query(u, v);
-            assert!(
-                dnd_res == idt_res,
-                "Query results don't match after delete u = {u}, v = {v}, dnd_res = {dnd_res}, idt_res = {idt_res}"
-            );
-        }
-
-        for &(u, v) in mtx_data.all_edges.iter() {
-            assert_eq!(
-                connected_dnd(&mut dnd, u, v),
-                connected_idtree(&mut idt, u, v)
-            );
-        }
-    }
-}
-
 mod cpp_tests {
     use super::*;
     use cxx::UniquePtr;
@@ -880,7 +566,7 @@ mod cpp_tests {
     #[test]
     fn test_basic_insert_delete_query() {
         let edges = vec![(0, 1), (1, 2), (2, 3)];
-        let t = setup_cpp_tree(4, &edges, USE_DSU);
+        let t = setup_cpp_tree(4, &edges);
 
         assert!(t.query(0, 3), "query 1");
         t.delete_edge(1, 2);
@@ -892,7 +578,7 @@ mod cpp_tests {
     #[test]
     fn test_unlink_splits_correctly() {
         let edges = vec![(0, 1), (1, 2), (2, 3)];
-        let t = setup_cpp_tree(4, &edges, USE_DSU);
+        let t = setup_cpp_tree(4, &edges);
 
         t.delete_edge(1, 2);
         assert!(t.query(0, 1));
@@ -903,7 +589,7 @@ mod cpp_tests {
     #[test]
     fn test_replacement_edge_found() {
         let edges = vec![(0, 1), (1, 2), (2, 3), (0, 3)];
-        let t = setup_cpp_tree(4, &edges, USE_DSU);
+        let t = setup_cpp_tree(4, &edges);
 
         let r = t.delete_edge(1, 2);
         assert_eq!(r, 1);
@@ -914,7 +600,7 @@ mod cpp_tests {
     #[test]
     fn test_replacement_edge_not_found() {
         let edges = vec![(0, 1), (1, 2), (2, 3)];
-        let t = setup_cpp_tree(4, &edges, USE_DSU);
+        let t = setup_cpp_tree(4, &edges);
 
         let r = t.delete_edge(1, 2);
         assert_eq!(r, 2);
@@ -936,10 +622,10 @@ mod cpp_tests {
         }
 
         let adj_id = make_adj_usize(n, &edges);
-        let cpp_edges: Vec<(i32, i32)> = edges.iter().map(|&(u, v)| (u as i32, v as i32)).collect();
+        let cpp_edges: Vec<(usize, usize)> = edges.iter().map(|&(u, v)| (u, v)).collect();
 
-        let cpp = setup_cpp_tree(n, &cpp_edges, USE_DSU);
-        let mut idt = IdTree::new(&adj_id);
+        let cpp = setup_cpp_tree(n, &cpp_edges);
+        let mut idt = IDTree::new(&adj_id);
 
         for _ in 0..200 {
             let u = rng.random_range(0..n);
@@ -974,10 +660,7 @@ mod cpp_tests {
         let edges = make_edges_for_nodes(n, n * 2);
         let (present_edges, absent_edges) = edges.split_at(n);
 
-        let cpp_init: Vec<(i32, i32)> = present_edges
-            .iter()
-            .map(|&(u, v)| (u as i32, v as i32))
-            .collect();
+        let cpp_init: Vec<(usize, usize)> = present_edges.iter().map(|&(u, v)| (u, v)).collect();
 
         let mut max_node_id = 0;
         for &(u, v) in present_edges.iter() {
@@ -990,7 +673,7 @@ mod cpp_tests {
         }
         assert!(max_node_id <= n);
         debug!("max_node_id = {}, n = {}", max_node_id, n);
-        let tree = setup_cpp_tree(max_node_id, &cpp_init, USE_DSU);
+        let tree = setup_cpp_tree(max_node_id, &cpp_init);
 
         let mut present: Vec<usize> = (0..n).collect();
         let mut absent: Vec<usize> = (0..n).collect();
@@ -1029,16 +712,9 @@ mod cpp_tests {
         let (present_edges, absent_edges) = edges.split_at(n);
 
         let adj = make_caterpillar_graph(n, 0.3, 0.05);
-        let mut init_edges = vec![];
-        for (u, neighbors) in adj.iter() {
-            for &v in neighbors {
-                if (*u as i32) < v {
-                    init_edges.push((*u as i32, v));
-                }
-            }
-        }
+        let cpp_init: Vec<(usize, usize)> = present_edges.iter().map(|&(u, v)| (u, v)).collect();
 
-        let tree = setup_cpp_tree(n, &init_edges, USE_DSU);
+        let tree = setup_cpp_tree(n, &cpp_init);
 
         let num_query_pairs = (QUERY_FACTOR * n as f64) as usize;
         let mut query_pairs = Vec::with_capacity(num_query_pairs);
@@ -1067,10 +743,10 @@ mod cpp_tests {
         }
     }
 
-    fn verify_idtree_topology_sync(cpp: &UniquePtr<ffi::CPPDNDTree>, idt: &IdTree, n: usize) {
+    fn verify_idtree_topology_sync(cpp: &UniquePtr<ffi::CPPDNDTree>, idt: &IDTree, n: usize) {
         for i in 0..n {
             let cpp_p = cpp.get_tree_parent(i as i32);
-            let idt_p = idt.get_parent(i); // Assuming this is your IdTree getter
+            let idt_p = idt.get_parent(i); // Assuming this is your IDTree getter
 
             if cpp_p != idt_p as i32 {
                 panic!(
@@ -1097,8 +773,8 @@ mod cpp_tests {
         let all_nodes = mtx_data.empty_map_i32.keys().collect::<Vec<_>>();
         let node_count = all_nodes.len();
 
-        let cpp = setup_cpp_tree(all_nodes.len(), &[], USE_DSU);
-        let mut idt = IdTree::new(&mtx_data.empty_map_usize);
+        let cpp = setup_cpp_tree(all_nodes.len(), &[]);
+        let mut idt = IDTree::new(&mtx_data.empty_map_usize);
 
         // Insertion Phase
         for &(u, v) in mtx_data.all_edges.iter() {

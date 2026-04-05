@@ -661,17 +661,11 @@ impl DNDTree {
 
                 // NOTE: It is tempting to short-circuit this loop with
                 //         `&& self.generations[neighbor] != cur_generation`
-                //       which would be fine if the Eager mark is not used, but with both it
-                //       can cause improper subtree setup in the scratch collection which is used
-                //       by remove_subtree_union_find when DSU is enabled.
+                //       but that can cause improper subtree setup in the scratch collection
                 //       (See the with_dsu::test_mixed_ops_query_heavy test case.)
-                //       For a non-DSU dedicated build this may be worth more optimization but
-                //       for the DSU dedicated build it is not and using the Eager mark by itself
-                //       really does nothing. So the commented out logic is being left for reference
-                //       when working on specialized builds.
-                if self.nodes[neighbor].parent == node
-                // && self.generations[neighbor] != cur_generation
-                {
+                //       For a non-DSU dedicated build for a specific graph this may be worth the
+                //       performance optimization but requires careful analysis.
+                if self.nodes[neighbor].parent == node {
                     self.vec_scratch_nodes.push(neighbor);
                     self.generations[neighbor] = cur_generation;
                     continue;
@@ -682,7 +676,6 @@ impl DNDTree {
                     if self.generations[w] == cur_generation {
                         continue 'neighbors;
                     }
-                    // self.generations[w] = cur_generation; // Eager mark
                     w = self.nodes[w].parent;
                 }
 
