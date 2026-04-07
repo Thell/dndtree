@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "dndtree"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cxx",
  "cxx-build",
@@ -362,7 +362,9 @@ checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 
 [[package]]
 name = "idtree"
-version = "0.1.2"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "512edcc53b7de6e3df1b1d6683a9733cf5490fa7a06f50bf17b18b57d1793e30"
 dependencies = [
  "cxx",
  "cxx-build",
