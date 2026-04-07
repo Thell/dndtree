@@ -1,124 +1,476 @@
 // This is primarily an ad-hoc profiling build.
 //
 #![allow(dead_code)]
+use std::env;
+use std::fmt;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
+use std::time::Instant;
+
 use dndtree::DNDTree;
+use dndtree::bridge::ffi;
+use hdrhistogram::Histogram;
 use nohash_hasher::{IntMap, IntSet};
 use rand::SeedableRng;
 use rand::prelude::SliceRandom;
+use rand::prelude::*;
 use rand::rngs::StdRng;
+use statrs::statistics::Statistics;
 
-const QUERY_FACTOR: usize = 10;
-
-fn make_adj(n: usize) -> IntMap<usize, IntSet<usize>> {
-    let mut adj: IntMap<usize, IntSet<usize>> = IntMap::default();
-    for i in 0..n {
-        adj.insert(i, IntSet::default());
-    }
-    adj
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum TaskVariant {
+    CPPDNDTree,
+    DNDTree,
 }
 
-fn make_edges(n: usize) -> Vec<(usize, usize)> {
-    let mut edges = Vec::with_capacity(n);
-    for i in 0..n {
-        let u = i % n;
-        let v = (i * 7 + 13) % n;
-        if u != v {
-            edges.push((u, v));
+impl TaskVariant {
+    fn name(&self) -> &'static str {
+        match self {
+            TaskVariant::CPPDNDTree => "CPPDNDTree",
+            TaskVariant::DNDTree => "DNDTree",
         }
     }
-    edges
 }
 
-fn make_edges_for_nodes(node_count: usize, edge_count: usize) -> Vec<(usize, usize)> {
-    let mut edges = Vec::with_capacity(edge_count);
-    for i in 0..edge_count {
-        let u = i % node_count;
-        let v = (i * 7 + 13) % node_count;
-        if u != v {
-            edges.push((u, v));
+#[derive(Clone, Copy)]
+struct Task {
+    variant: TaskVariant,
+}
+
+impl fmt::Display for Task {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.variant.name())
+    }
+}
+
+impl Task {
+    fn new(variant: TaskVariant) -> Task {
+        Task { variant }
+    }
+}
+
+// MARK: Reporting
+
+#[derive(Debug, Clone, Copy)]
+enum OpType {
+    Insertion,
+    QueryCold,
+    QueryWarm,
+    Deletion,
+}
+
+impl fmt::Display for OpType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OpType::Insertion => write!(f, "INSERTION"),
+            OpType::QueryCold => write!(f, "QUERY (COLD)"),
+            OpType::QueryWarm => write!(f, "QUERY (WARM)"),
+            OpType::Deletion => write!(f, "DELETION"),
         }
     }
-    edges
 }
 
-#[inline(never)]
-fn mixed_ops(n: usize) {
-    let mut edges = make_edges(n * 2);
-    let mut rng = StdRng::seed_from_u64(12345);
-    edges.shuffle(&mut rng);
+fn report(task: Task, sample_data: Vec<Vec<Vec<(i32, usize)>>>) {
+    println!("\nTASK: {}", task);
+    println!(
+        "{:<24} | {:<8} | {:<10} | {:<10} | {:<8} | {:<8} | {:<8}",
+        "Result Type", "Count", "Mean (ns)", "StdDev", "P50", "P99", "Max"
+    );
 
-    let (present, absent) = edges.split_at_mut(n);
+    let op_types = [
+        OpType::Insertion,
+        OpType::QueryCold,
+        OpType::QueryWarm,
+        OpType::Deletion,
+    ];
 
-    let mut adj = make_adj(n * 2);
-    for &(u, v) in present.iter() {
-        adj.get_mut(&u).unwrap().insert(v);
-        adj.get_mut(&v).unwrap().insert(u);
-    }
+    for (op_idx, op_type) in op_types.iter().enumerate() {
+        let mut raw_nanos_map: IntMap<i32, Vec<usize>> = IntMap::default();
 
-    let mut tree = DNDTree::new(&adj);
-    for i in 0..n {
-        let (du, dv) = present[i];
-        tree.delete_edge(du, dv);
-
-        let (qu, qv) = present[i % present.len()];
-        let _ = tree.query(qu, qv);
-
-        let (iu, iv) = absent[i];
-        tree.insert_edge(iu, iv);
-    }
-}
-
-fn mixed_ops_query_heavy(n: usize) {
-    let mut edges = make_edges_for_nodes(n, n * 2);
-    let mut rng = StdRng::seed_from_u64(12345);
-    edges.shuffle(&mut rng);
-
-    let (present_edges, absent_edges) = edges.split_at(n);
-
-    let mut adj = make_adj(n);
-    for &(u, v) in present_edges.iter() {
-        adj.get_mut(&u).unwrap().insert(v);
-        adj.get_mut(&v).unwrap().insert(u);
-    }
-
-    let mut tree = DNDTree::new(&adj);
-
-    let mut present: Vec<usize> = (0..n).collect();
-    let mut absent: Vec<usize> = (0..n).collect();
-
-    for i in 0..n {
-        let pi = present[i];
-        let (du, dv) = present_edges[pi];
-        tree.delete_edge(du, dv);
-
-        for q in 0..n / QUERY_FACTOR {
-            let qi = present[(i + q) % n];
-            let (qu, qv) = present_edges[qi];
-            let _ = tree.query(qu, qv);
+        for sample in &sample_data {
+            if let Some(trace) = sample.get(op_idx) {
+                for &(code, nanos) in trace {
+                    raw_nanos_map.entry(code).or_default().push(nanos);
+                }
+            }
         }
 
-        let ai = absent[i];
-        let (iu, iv) = absent_edges[ai];
-        tree.insert_edge(iu, iv);
+        if raw_nanos_map.is_empty() {
+            continue;
+        }
 
-        present[i] = ai;
-        absent[i] = pi;
+        println!("{}", "-".repeat(90));
+        println!("--- {} ---", op_type);
+
+        let mut sorted_codes: Vec<_> = raw_nanos_map.keys().collect();
+        sorted_codes.sort();
+
+        for &code in sorted_codes {
+            let nanos_vec = &raw_nanos_map[&code];
+
+            let mut hist = Histogram::<u64>::new_with_bounds(1, 100_000_000, 3).unwrap();
+            let mut f64_samples: Vec<f64> = Vec::with_capacity(nanos_vec.len());
+
+            for &n in nanos_vec {
+                let _ = hist.record(n as u64);
+                f64_samples.push(n as f64);
+            }
+
+            let mean = f64_samples.as_slice().mean();
+            let std_dev = f64_samples.as_slice().std_dev();
+
+            // Map integer codes to descriptive labels based on OpType
+            let label = match op_type {
+                OpType::Insertion => match code {
+                    0 => "Non-Tree Edge",
+                    1 => "Tree Edge",
+                    2 => "Non-Tree Reroot",
+                    3 => "Tree Reroot",
+                    _ => "Invalid/Other",
+                },
+                OpType::Deletion => match code {
+                    0 => "Non-Tree Edge",
+                    1 => "Tree Edge (Split)",
+                    2 => "Tree Edge (Replaced)",
+                    _ => "Invalid/Other",
+                },
+                OpType::QueryCold | OpType::QueryWarm => match code {
+                    0 => "Disconnected",
+                    1 => "Connected",
+                    _ => "Invalid/Other",
+                },
+            };
+
+            println!(
+                "{:<24} | {:<8} | {:<10.2} | {:<10.2} | {:<8} | {:<8} | {:<8}",
+                label,
+                nanos_vec.len(),
+                mean,
+                std_dev,
+                hist.value_at_quantile(0.5),
+                hist.value_at_quantile(0.99),
+                hist.max()
+            );
+        }
     }
 }
 
-// Take argv arguments for n and for use_uf
+// MARK: Data Preparation
+struct BenchData {
+    n: usize,
+    all_edges: Vec<(usize, usize)>,
+    del_edges: Vec<(usize, usize)>,
+    empty_map: IntMap<usize, IntSet<usize>>,
+    dnd_tree: DNDTree,
+    query_dnd_tree: DNDTree,
+    query_edges: Vec<(usize, usize)>,
+}
+
+impl BenchData {
+    fn new(filename: &str) -> Self {
+        let adj_list = BenchData::load_graph(filename);
+        let mut adj_dict: IntMap<usize, IntSet<usize>> = IntMap::default();
+        for &u in adj_list.keys() {
+            adj_dict.entry(u).or_default();
+            for &v in adj_list.get(&u).unwrap() {
+                adj_dict.entry(v).or_default();
+                adj_dict.get_mut(&u).unwrap().insert(v);
+                adj_dict.get_mut(&v).unwrap().insert(u);
+            }
+        }
+
+        let mut empty_map: IntMap<usize, IntSet<usize>> = IntMap::default();
+        for &u in adj_list.keys() {
+            empty_map.entry(u).or_default();
+            for &v in adj_list.get(&u).unwrap() {
+                empty_map.entry(v).or_default();
+            }
+        }
+
+        let mut all_edges: Vec<(usize, usize)> = adj_list
+            .iter()
+            .flat_map(|(&u, neighbors)| neighbors.iter().map(move |&v| (u as usize, v as usize)))
+            .collect();
+
+        let mut rng = StdRng::seed_from_u64(12345);
+        all_edges.shuffle(&mut rng);
+
+        let dnd_tree = DNDTree::new(&adj_dict);
+
+        let n = adj_dict.len();
+        let mut query_edges = Vec::new();
+        for _ in 0..1000 {
+            let u = rng.random_range(0..n);
+            let v = rng.random_range(0..n);
+            if u == v {
+                continue;
+            }
+            query_edges.push((u, v));
+        }
+
+        // Delete some of the edges to create cold trees
+        let deleted_count = all_edges.len() / 5;
+        let del_edges = all_edges
+            .iter()
+            .take(deleted_count)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut query_dnd_tree = dnd_tree.clone();
+
+        for &(u, v) in del_edges.iter() {
+            query_dnd_tree.delete_edge(u, v);
+        }
+
+        BenchData {
+            n,
+            all_edges,
+            del_edges,
+            empty_map,
+            dnd_tree,
+            query_dnd_tree,
+            query_edges,
+        }
+    }
+
+    fn load_graph(filename: &str) -> IntMap<usize, Vec<usize>> {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let mtx_path = PathBuf::from(manifest_dir)
+            .join("benches")
+            .join("data")
+            .join(filename);
+        let reader = BufReader::new(File::open(mtx_path).expect("MTX file missing"));
+
+        let mut adj_list: IntMap<usize, Vec<usize>> = IntMap::default();
+        let mut data_started = false;
+
+        for line in reader.lines().map_while(Result::ok) {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('%') {
+                continue;
+            }
+            if !data_started {
+                data_started = true;
+                continue;
+            }
+
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let mut u: usize = parts[0].parse().unwrap();
+                let mut v: usize = parts[1].parse().unwrap();
+                // Canonicalize
+                if u > v {
+                    std::mem::swap(&mut u, &mut v);
+                }
+                // MTX is 1-based; decrement to 0-based.
+                // Only add once as the graph is undirected and insert_edge handles symmetry.
+                adj_list.entry(u - 1).or_default().push(v - 1);
+            }
+        }
+        adj_list
+    }
+}
+
+fn setup_cpp_tree(
+    n: usize,
+    edges: &[(usize, usize)],
+    use_dsu: bool,
+) -> cxx::UniquePtr<ffi::CPPDNDTree> {
+    let mut adj = vec![vec![]; n];
+    for &(u, v) in edges {
+        if u < n && v < n {
+            adj[u as usize].push(v);
+            adj[v as usize].push(u);
+        }
+    }
+
+    let mut degrees = Vec::with_capacity(n);
+    let mut flat_neighbors = Vec::new();
+    for neighbors in &adj {
+        degrees.push(neighbors.len() as i32);
+        for &v in neighbors {
+            flat_neighbors.push(v as i32);
+        }
+    }
+
+    ffi::new_cpp_dndtree_from_flat_adj(n as i32, &degrees, &flat_neighbors, use_dsu)
+}
+
+// MARK: Benchmarks
+
+fn trace_insertion(task: Task, data: &BenchData) -> Vec<(i32, usize)> {
+    if task.variant == TaskVariant::CPPDNDTree {
+        let tree = setup_cpp_tree(data.n, &[], true);
+        let mut trace = Vec::with_capacity(data.all_edges.len());
+
+        for &(u, v) in data.all_edges.iter() {
+            let time = Instant::now();
+            let res = tree.insert_edge(u as i32, v as i32);
+            let elapsed = time.elapsed().as_nanos() as usize;
+            trace.push((res, elapsed));
+        }
+
+        return trace;
+    }
+
+    let mut tree = DNDTree::new(&data.empty_map);
+    let mut trace = Vec::with_capacity(data.all_edges.len());
+
+    for &(u, v) in data.all_edges.iter() {
+        let time = Instant::now();
+        let res = tree.insert_edge(u, v);
+        let elapsed = time.elapsed().as_nanos() as usize;
+        trace.push((res, elapsed));
+    }
+
+    trace
+}
+
+fn trace_query_cold(task: Task, data: &BenchData) -> Vec<(i32, usize)> {
+    if task.variant == TaskVariant::CPPDNDTree {
+        let tree = setup_cpp_tree(data.n, &data.all_edges, true);
+        let mut trace = Vec::with_capacity(data.all_edges.len());
+
+        for &(u, v) in data.del_edges.iter() {
+            tree.delete_edge(u as i32, v as i32);
+        }
+
+        for &(u, v) in data.query_edges.iter() {
+            let time = Instant::now();
+            let res = tree.query(u as i32, v as i32);
+            let elapsed = time.elapsed().as_nanos() as usize;
+            trace.push((res as i32, elapsed));
+        }
+
+        return trace;
+    }
+
+    let mut tree = match task.variant {
+        TaskVariant::DNDTree => data.query_dnd_tree.clone(),
+        _ => unreachable!(),
+    };
+    let mut trace = Vec::with_capacity(data.query_edges.len());
+
+    for &(u, v) in data.query_edges.iter() {
+        let time = Instant::now();
+        let res = tree.query(u, v);
+        let elapsed = time.elapsed().as_nanos() as usize;
+        trace.push((res as i32, elapsed));
+    }
+    trace
+}
+
+fn trace_query_warm(task: Task, data: &BenchData) -> Vec<(i32, usize)> {
+    if task.variant == TaskVariant::CPPDNDTree {
+        let tree = setup_cpp_tree(data.n, &data.all_edges, true);
+        for &(u, v) in data.del_edges.iter() {
+            tree.delete_edge(u as i32, v as i32);
+        }
+
+        // run through one time to warm up
+        for &(u, v) in data.query_edges.iter() {
+            tree.query(u as i32, v as i32);
+        }
+
+        let mut trace = Vec::with_capacity(data.query_edges.len());
+
+        for &(u, v) in data.query_edges.iter() {
+            let time = Instant::now();
+            let res = tree.query(u as i32, v as i32);
+            let elapsed = time.elapsed().as_nanos() as usize;
+            trace.push((res as i32, elapsed));
+        }
+
+        return trace;
+    }
+
+    let mut tree = match task.variant {
+        TaskVariant::DNDTree => data.query_dnd_tree.clone(),
+        _ => unreachable!(),
+    };
+    let mut trace = Vec::with_capacity(data.query_edges.len());
+
+    for &(u, v) in data.query_edges.iter() {
+        tree.query(u, v);
+    }
+
+    for &(u, v) in data.query_edges.iter() {
+        let time = Instant::now();
+        let res = tree.query(u, v);
+        let elapsed = time.elapsed().as_nanos() as usize;
+        trace.push((res as i32, elapsed));
+    }
+    trace
+}
+
+fn trace_delete(task: Task, data: &BenchData) -> Vec<(i32, usize)> {
+    if task.variant == TaskVariant::CPPDNDTree {
+        let tree = setup_cpp_tree(data.n, &data.all_edges, true);
+        let mut trace = Vec::with_capacity(data.all_edges.len());
+
+        for &(u, v) in data.all_edges.iter() {
+            let time = Instant::now();
+            let res = tree.delete_edge(u as i32, v as i32);
+            let elapsed = time.elapsed().as_nanos() as usize;
+            trace.push((res as i32, elapsed));
+        }
+
+        return trace;
+    }
+
+    let mut tree = match task.variant {
+        TaskVariant::DNDTree => data.dnd_tree.clone(),
+        _ => unreachable!(),
+    };
+    let mut trace = Vec::with_capacity(data.all_edges.len());
+
+    for &(u, v) in data.all_edges.iter() {
+        let time = Instant::now();
+        let res = tree.delete_edge(u, v);
+        let elapsed = time.elapsed().as_nanos() as usize;
+        trace.push((res as i32, elapsed));
+    }
+    trace
+}
+
+fn bench_task(task: Task, data: &BenchData, sample_count: u32) {
+    let mut sample_data = Vec::with_capacity(sample_count as usize);
+    for _ in 0..sample_count {
+        let traces = vec![
+            trace_insertion(task, data),
+            trace_query_cold(task, data),
+            trace_query_warm(task, data),
+            trace_delete(task, data),
+        ];
+        sample_data.push(traces);
+    }
+
+    report(task, sample_data);
+}
+
+fn profile(n: usize, filename: &str) {
+    println!("\nPreparing {} data...", filename);
+
+    let start_time = Instant::now();
+    let bench_data = BenchData::new(filename);
+    println!("Prepared in {} ms", start_time.elapsed().as_millis());
+
+    let task = Task::new(TaskVariant::DNDTree);
+    bench_task(task, &bench_data, n as u32);
+}
+
+// Take argv arguments for n and mtx data file name
 fn main() {
     use std::env;
     let args: Vec<String> = env::args().collect();
 
     let n: usize = args[1].parse().unwrap();
+    let filename: &str = &args[2];
 
     let start_time = std::time::Instant::now();
-    mixed_ops(n);
-    // mixed_ops_query_heavy(n, use_uf);
+    profile(n, filename);
     let elapsed = start_time.elapsed();
+
     println!("{} took {} microseconds", n, elapsed.as_micros());
-    // Wait for user input
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input).unwrap();
 }

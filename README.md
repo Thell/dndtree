@@ -58,23 +58,23 @@ This is a medium sized (126k nodes) graph with average degree 2.
 Result Type              | Mean (ns)  | Mean (ns)  | Mean (ns)  
 -----------------------------------------------------------------
 --- INSERTION ---                                               
-Non-Tree Edge            | 2590.14    | 2474.09    | 1790.93    
-Tree Edge                | 480.23     | 251.95     | 270.27     
-Non-Tree Reroot          | 745.96     | 392.92     | 449.04     
-Tree Reroot              | 426.55     | 146.56     | 221.23     
+Non-Tree Edge            | 2590.14    | 2474.09    | 1699.68    
+Tree Edge                | 480.23     | 251.95     | 234.50     
+Non-Tree Reroot          | 745.96     | 392.92     | 391.72     
+Tree Reroot              | 426.55     | 146.56     | 181.44     
 -----------------------------------------------------------------
 --- QUERY (COLD) ---                                            
-Disconnected             | 120.87     | 2499.36    | 117.32     
-Connected                | 75.03      | 4215.66    | 117.66     
+Disconnected             | 120.87     | 2499.36    | 111.04     
+Connected                | 75.03      | 4215.66    | 116.51     
 -----------------------------------------------------------------
 --- QUERY (WARM) ---                                            
-Disconnected             | 36.25      | 1716.17    | 30.56      
-Connected                | 33.66      | 3291.43    | 27.89      
+Disconnected             | 36.25      | 1716.17    | 30.28      
+Connected                | 33.66      | 3291.43    | 28.46      
 -----------------------------------------------------------------
 --- DELETION ---                                                
-Non-Tree Edge            | 215.90     | 74.85      | 80.13      
-Tree Edge (Split)        | 5209.38    | 3072.58    | 3216.76    
-Tree Edge (Replaced)     | 846.16     | 244.82     | 481.05     
+Non-Tree Edge            | 215.90     | 74.85      | 81.31      
+Tree Edge (Split)        | 5209.38    | 3072.58    | 3120.77    
+Tree Edge (Replaced)     | 846.16     | 244.82     | 390.12     
 ```
 
 ## bdo_exploration_graph.mtx
@@ -85,21 +85,21 @@ This is a small planar graph (~1k nodes) with average 2.6 degrees.
 Result Type              | Mean (ns)  | Mean (ns)  | Mean (ns)  
 ----------------------------------------------------------------
 --- INSERTION ---                                         
-Non-Tree Edge            | 269.37     | 147.24     | 135.58      
-Tree Edge                | 143.41     | 52.24      | 62.76       
-Non-Tree Reroot          | 335.36     | 168.10     | 162.98      
-Tree Reroot              | 158.55     | 53.06      | 78.97       
+Non-Tree Edge            | 269.37     | 147.24     | 123.83      
+Tree Edge                | 143.41     | 52.24      | 56.48       
+Non-Tree Reroot          | 335.36     | 168.10     | 153.10      
+Tree Reroot              | 158.55     | 53.06      | 64.88       
 -----------------------------------------------------------------
 --- QUERY (COLD) ---                                             
-Disconnected             | 35.10      | 43.85      | 31.08       
-Connected                | 36.26      | 49.94      | 32.92       
+Disconnected             | 35.10      | 43.85      | 30.57       
+Connected                | 36.26      | 49.94      | 31.21       
 -----------------------------------------------------------------
 --- QUERY (WARM) ---                                             
-Disconnected             | 31.58      | 43.38      | 28.40       
-Connected                | 31.65      | 49.28      | 28.44       
+Disconnected             | 31.58      | 43.38      | 28.94       
+Connected                | 31.65      | 49.28      | 29.01       
 -----------------------------------------------------------------
 --- DELETION ---                                                 
-Non-Tree Edge            | 95.94      | 39.69      | 39.74       
-Tree Edge (Split)        | 544.92     | 182.60     | 192.75      
-Tree Edge (Replaced)     | 217.16     | 61.39      | 133.69      
+Non-Tree Edge            | 95.94      | 39.69      | 38.73       
+Tree Edge (Split)        | 544.92     | 182.60     | 179.81      
+Tree Edge (Replaced)     | 217.16     | 61.39      | 79.31       
 ```
