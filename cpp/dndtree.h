@@ -177,8 +177,9 @@ inline void Node::flush()
     ins_buf.clear();
     del_buf.clear();
 
-    // // sort l
-    // sort(l.begin(), l.end());
+    // sort l -= this is not part of the reference design and is done for divergence testing
+    sort(l.begin(), l.end());
+
     adj = l;
 }
 
@@ -264,18 +265,6 @@ inline DNDTree::DNDTree(string path, bool load_graph, bool use_union_find)
     printf("Graph loaded, n = %d, m = %lld\n", n, m / 2);
 }
 
-// inline DNDTree::DNDTree(int n_nodes, const std::vector<std::vector<int>>& adj_list, bool use_union_find) {
-//     this->n = n_nodes;
-//     this->use_union_find = use_union_find;
-//     this->nodes.resize(n_nodes);
-//     this->l_nodes.resize(n_nodes);
-//     for (int i = 0; i < n_nodes; ++i) {
-//         this->nodes[i].adj = adj_list[i]; // Accepts the empty or pre-filled adj
-//         this->l_nodes[i].v = i;
-//     }
-//     this->init();
-// }
-// dndtree.h
 inline DNDTree::DNDTree(int n_nodes, const std::vector<std::vector<int>>& adj_list, bool use_union_find) {
     this->n = n_nodes;
     this->use_union_find = use_union_find;
@@ -646,7 +635,7 @@ inline bool DNDTree::find_replacement(int u, int f)
     for (int i = 0; i < (int)q.size(); ++i)
     {
         int x = q[i], p, pp;
-        nodes[x].flush(); // ensure all buffured operations are done
+        nodes[x].flush();
         if (G_TRACE_ENABLED) {
             std::cout << "[CPP]   scanning neighbors of (" << x << ")" << std::endl;
             std::cout << "[CPP]     adj for node " << u << ": ";
@@ -686,12 +675,8 @@ inline bool DNDTree::find_replacement(int u, int f)
             if (!succ)
                 continue;
 
-            for (p = nodes[x].p, nodes[x].p = y; p != -1;) {
-                pp = nodes[p].p;
-                nodes[p].p = x;
-                x = p;
-                p = pp;
-            }
+            for (p = nodes[x].p, nodes[x].p = y; p != -1;)
+                pp = nodes[p].p, nodes[p].p = x, x = p, p = pp;
 
             int s = (nodes[f].sub_cnt + nodes[u].sub_cnt) / 2, r = -1;
             for (p = y; p != -1; p = nodes[p].p)
@@ -701,11 +686,8 @@ inline bool DNDTree::find_replacement(int u, int f)
                     r = p;
             }
 
-            for (p = nodes[x].p; p != y; x = p, p = nodes[p].p) {
-                nodes[x].sub_cnt -= nodes[p].sub_cnt;
-                nodes[p].sub_cnt += nodes[x].sub_cnt;
-            }
-
+            for (p = nodes[x].p; p != y; x = p, p = nodes[p].p)
+                nodes[x].sub_cnt -= nodes[p].sub_cnt, nodes[p].sub_cnt += nodes[x].sub_cnt;
             for (int k = 0; k < (int)l.size(); ++k)
                 used[l[k]] = false;
 

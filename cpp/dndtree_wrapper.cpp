@@ -1,3 +1,5 @@
+// dndtree_wrapper.cpp
+
 #include "dndtree_wrapper.h"
 #include <vector>
 
@@ -35,13 +37,28 @@ int CPPDNDTree::get_subtree_size(int u) const {
     return inner->nodes[u].sub_cnt;
 }
 
+std::unique_ptr<CPPDNDTree> new_cpp_dndtree(
+    int32_t n, 
+    rust::Slice<const rust::Vec<int32_t>> adj, 
+    bool use_union_find
+) {
+    // Convert rust::Vec of rust::Vec to std::vector of std::vector
+    std::vector<std::vector<int>> cpp_adj(n);
+    for (int i = 0; i < n; ++i) {
+        cpp_adj[i].assign(adj[i].begin(), adj[i].end());
+    }
+
+    auto wrapper = std::make_unique<CPPDNDTree>();
+    wrapper->inner = std::make_unique<DNDTree>(n, cpp_adj, use_union_find);
+    return wrapper;
+}
+
 std::unique_ptr<CPPDNDTree> new_cpp_dndtree_from_flat_adj(
     int32_t n,
     rust::Slice<const int32_t> degrees,
     rust::Slice<const int32_t> flat_neighbors,
     bool use_union_find
 ) {
-    // 1. Reconstruct the adjacency list from the flat slices
     std::vector<std::vector<int>> adj_list(n);
     size_t offset = 0;
 
@@ -56,11 +73,7 @@ std::unique_ptr<CPPDNDTree> new_cpp_dndtree_from_flat_adj(
         }
     }
 
-    // 2. Create the wrapper object
     auto wrapper = std::make_unique<CPPDNDTree>();
-    
-    // 3. Initialize the inner DNDTree using the reconstructed adj_list
     wrapper->inner = std::make_unique<DNDTree>(n, adj_list, use_union_find);
-    
     return wrapper;
 }
