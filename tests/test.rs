@@ -353,7 +353,7 @@ fn make_adj_usize(n: usize, edges: &[(usize, usize)]) -> IntMap<usize, IntSet<us
 mod cpp_tests {
     use super::*;
     use cxx::UniquePtr;
-    use idtree::bridge::ffi;
+    use dndtree::bridge::ffi;
     use log::debug;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
